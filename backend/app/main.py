@@ -396,6 +396,8 @@ async def delete_connection(
 @app.get("/mcp/{connection_id}/sse")
 async def mcp_sse(connection_id: str, request: Request, db: Session = Depends(get_db)):
     """SSE endpoint for MCP protocol"""
+    logger.info(f"SSE endpoint called for connection: {connection_id}")
+    
     # Get connection from database
     conn = db.query(SnowflakeConnection).filter(
         SnowflakeConnection.id == connection_id
@@ -404,34 +406,35 @@ async def mcp_sse(connection_id: str, request: Request, db: Session = Depends(ge
     if not conn or not conn.active:
         raise HTTPException(status_code=404, detail="Connection not found or not active")
     
-    logger.info(f"Establishing SSE connection for {connection_id}")
-    
     # Get the full URL for the messages endpoint
     base_url = str(request.url).replace('/sse', '')
     messages_url = f"{base_url}/messages"
     
-    # Create event generator
-    async def event_generator():
-        # CRITICAL: Send initial endpoint event with full URL
-        yield {
-            "event": "endpoint",
-            "data": messages_url
-        }
-        
-        # Keep connection alive with periodic pings
+    async def generate() -> AsyncGenerator[str, None]:
+        """Generate SSE events"""
         try:
+            # Send initial endpoint event
+            yield f"event: endpoint\ndata: {messages_url}\n\n"
+            
+            # Keep connection alive
             while True:
                 await asyncio.sleep(30)
-                # Send ping
-                yield {
-                    "event": "ping",
-                    "data": ""
-                }
+                yield f"event: ping\ndata: \n\n"
+                
         except asyncio.CancelledError:
             logger.info(f"SSE connection closed for {connection_id}")
-            pass
+            return
     
-    return EventSourceResponse(event_generator())
+    return StreamingResponse(
+        generate(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+            "Access-Control-Allow-Origin": "*",
+        }
+    )
 
 @app.post("/mcp/{connection_id}/messages")
 async def mcp_messages(
