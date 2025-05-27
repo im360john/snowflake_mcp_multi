@@ -8,9 +8,9 @@ services:
   - type: web
     name: snowflake-mcp-backend
     plan: starter
-    env: docker  # Changed from 'runtime: docker' to 'env: docker'
-    dockerfilePath: ./backend/Dockerfile
-    dockerContext: ./backend
+    env: python
+    buildCommand: "pip install -r backend/requirements.txt"
+    startCommand: "cd backend && uvicorn app.main:app --host 0.0.0.0 --port $PORT"
     envVars:
       - key: DATABASE_URL
         fromDatabase:
@@ -22,14 +22,16 @@ services:
         value: "8100"
       - key: PORT_RANGE_END
         value: "8200"
+      - key: PYTHON_VERSION
+        value: "3.11"
 
-  # Frontend
+  # Frontend (using static site instead of Docker)
   - type: web
     name: snowflake-mcp-frontend
     plan: starter
-    env: docker  # Changed from 'runtime: docker' to 'env: docker'
-    dockerfilePath: ./frontend/Dockerfile
-    dockerContext: ./frontend
+    env: static
+    buildCommand: "cd frontend && npm install && npm run build"
+    staticPublishPath: ./frontend/build
     envVars:
       - key: REACT_APP_API_URL
         fromService:
