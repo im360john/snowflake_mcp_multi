@@ -397,11 +397,12 @@ async def delete_connection(
     logger.info(f"Connection {connection_id} deleted successfully")
     return {"message": "Connection deleted"}
 
-# MCP SSE Endpoint - Fixed for Render with aggressive flushing
+# MCP SSE Endpoint - Optimized for Claude and Render
 @app.get("/mcp/{connection_id}/sse")
 async def mcp_sse(connection_id: str, request: Request, db: Session = Depends(get_db)):
-    """SSE endpoint for MCP protocol - fixed for Render deployment"""
+    """SSE endpoint for MCP protocol - optimized for Claude client and Render deployment"""
     logger.info(f"SSE endpoint called for connection: {connection_id}")
+    logger.info(f"User-Agent: {request.headers.get('user-agent', 'Unknown')}")
     
     # Get connection from database
     conn = db.query(SnowflakeConnection).filter(
@@ -419,7 +420,7 @@ async def mcp_sse(connection_id: str, request: Request, db: Session = Depends(ge
     messages_url = f"{base_url}/messages"
     
     async def event_stream() -> AsyncGenerator[bytes, None]:
-        """Generate SSE events with aggressive flushing for Render"""
+        """Generate SSE events optimized for Claude client"""
         # Track this connection
         active_sse_connections[session_id] = {
             "connection_id": connection_id,
@@ -430,32 +431,15 @@ async def mcp_sse(connection_id: str, request: Request, db: Session = Depends(ge
         try:
             logger.info(f"Starting SSE stream for connection: {connection_id}, session: {session_id}")
             
-            # Send initial burst of data to prevent Render timeout
-            # Render seems to wait for a certain amount of data before starting to stream
-            
-            # 1. Send retry instruction
-            yield b"retry: 3000\n\n"
-            
-            # 2. Send endpoint event
+            # CRITICAL: Send the endpoint URL immediately as the first event
+            # Claude expects this specific format
             yield f"event: endpoint\ndata: {messages_url}\n\n".encode('utf-8')
+            logger.info(f"Sent endpoint URL: {messages_url}")
             
-            # 3. Send initial status to confirm connection
-            initial_status = {
-                "type": "connection_established",
-                "session": session_id,
-                "timestamp": datetime.now().isoformat(),
-                "message": "SSE connection established successfully"
-            }
-            yield f"event: status\ndata: {json.dumps(initial_status)}\n\n".encode('utf-8')
+            # Send a flush comment to ensure data is sent immediately
+            yield b":ok\n\n"
             
-            # 4. Send padding comments to force Render to start streaming
-            # This is a workaround for Render's buffering behavior
-            padding = " " * 512  # 512 bytes of padding
-            yield f": {padding}\n\n".encode('utf-8')
-            
-            logger.info(f"Sent initial burst of data for session: {session_id}")
-            
-            # Now start the regular heartbeat loop
+            # Now maintain the connection with minimal heartbeats
             heartbeat_counter = 0
             
             while True:
@@ -464,37 +448,28 @@ async def mcp_sse(connection_id: str, request: Request, db: Session = Depends(ge
                     logger.info(f"Client disconnected for session: {session_id}")
                     break
                 
-                # Wait first, then send heartbeat (to avoid immediate send after initial burst)
-                await asyncio.sleep(3)  # More frequent heartbeats for Render
+                # Wait 15 seconds between heartbeats (less frequent but enough to keep alive)
+                await asyncio.sleep(15)
                 
                 heartbeat_counter += 1
-                current_time = datetime.now()
                 
-                # Send keep-alive comment with padding to ensure data flows
-                yield f": heartbeat {heartbeat_counter} {current_time.isoformat()} {' ' * 256}\n\n".encode('utf-8')
+                # Send minimal keep-alive comment
+                yield f": hb-{heartbeat_counter}\n\n".encode('utf-8')
                 
-                # Every 2nd heartbeat, send actual event data
-                if heartbeat_counter % 2 == 0:
-                    heartbeat_data = {
-                        "type": "heartbeat",
-                        "count": heartbeat_counter,
-                        "timestamp": current_time.isoformat(),
-                        "session": session_id,
-                        "uptime_seconds": int((current_time - active_sse_connections[session_id]["started_at"]).total_seconds())
-                    }
-                    yield f"event: heartbeat\ndata: {json.dumps(heartbeat_data)}\n\n".encode('utf-8')
-                    logger.debug(f"Sent heartbeat event {heartbeat_counter} for session {session_id}")
+                # Log every 5th heartbeat
+                if heartbeat_counter % 5 == 0:
+                    logger.debug(f"Heartbeat {heartbeat_counter} for session {session_id}")
                 
                 # Update last heartbeat time
-                active_sse_connections[session_id]["last_heartbeat"] = current_time
+                active_sse_connections[session_id]["last_heartbeat"] = datetime.now()
                 
         except asyncio.CancelledError:
             logger.info(f"SSE connection cancelled for session: {session_id}")
             raise
         except Exception as e:
             logger.error(f"Error in SSE stream for session {session_id}: {e}", exc_info=True)
-            error_data = f"event: error\ndata: {json.dumps({'error': str(e), 'session': session_id})}\n\n"
-            yield error_data.encode('utf-8')
+            # Don't send error events to client as it might confuse Claude
+            raise
         finally:
             # Clean up connection tracking
             active_sse_connections.pop(session_id, None)
@@ -506,7 +481,6 @@ async def mcp_sse(connection_id: str, request: Request, db: Session = Depends(ge
         media_type="text/event-stream",
         headers={
             "Cache-Control": "no-cache",
-            "Connection": "keep-alive",
             "X-Accel-Buffering": "no",
         }
     )
