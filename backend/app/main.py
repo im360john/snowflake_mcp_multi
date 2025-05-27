@@ -1,4 +1,4 @@
-from fastapi import FastAPI, HTTPException, Depends
+from fastapi import FastAPI, HTTPException, Depends, Request
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy.orm import Session
 from contextlib import asynccontextmanager
@@ -378,7 +378,7 @@ async def delete_connection(
     logger.info(f"Connection {connection_id} deleted successfully")
     return {"message": "Connection deleted"}
 
-# MCP Endpoints
+# MCP SSE Endpoint - CRITICAL FIX HERE
 @app.get("/mcp/{connection_id}/sse")
 async def mcp_sse(connection_id: str, db: Session = Depends(get_db)):
     """SSE endpoint for MCP protocol"""
@@ -394,25 +394,34 @@ async def mcp_sse(connection_id: str, db: Session = Depends(get_db)):
     
     # Create event generator
     async def event_generator():
-        # Send initial connection event
+        # CRITICAL: Send initial endpoint event
+        # This tells the client where to POST messages
         yield {
-            "event": "open",
+            "event": "endpoint",
+            "data": f"/mcp/{connection_id}/messages"
+        }
+        
+        # Send a ready message
+        yield {
+            "event": "message", 
             "data": json.dumps({
-                "protocol": "mcp",
-                "version": "1.0.0",
-                "capabilities": {
-                    "tools": True
+                "jsonrpc": "2.0",
+                "method": "notification",
+                "params": {
+                    "method": "server.ready",
+                    "params": {}
                 }
             })
         }
         
-        # Keep connection alive
+        # Keep connection alive with periodic pings
         try:
             while True:
                 await asyncio.sleep(30)
+                # Send ping as a comment (SSE format)
                 yield {
                     "event": "ping",
-                    "data": json.dumps({"type": "ping"})
+                    "data": ""
                 }
         except asyncio.CancelledError:
             logger.info(f"SSE connection closed for {connection_id}")
@@ -423,7 +432,7 @@ async def mcp_sse(connection_id: str, db: Session = Depends(get_db)):
 @app.post("/mcp/{connection_id}/messages")
 async def mcp_messages(
     connection_id: str, 
-    request: dict,
+    request: Request,
     db: Session = Depends(get_db)
 ):
     """Handle MCP protocol messages"""
@@ -435,8 +444,11 @@ async def mcp_messages(
     if not conn or not conn.active:
         raise HTTPException(status_code=404, detail="Connection not found or not active")
     
-    method = request.get("method")
-    params = request.get("params", {})
+    # Parse request body
+    body = await request.json()
+    method = body.get("method")
+    params = body.get("params", {})
+    request_id = body.get("id")
     
     logger.info(f"Processing MCP message for {connection_id}: {method}")
     
@@ -455,7 +467,7 @@ async def mcp_messages(
     try:
         # Handle different MCP methods
         if method == "initialize":
-            return {
+            result = {
                 "protocolVersion": "1.0.0",
                 "capabilities": {
                     "tools": {
@@ -465,7 +477,7 @@ async def mcp_messages(
             }
         
         elif method == "tools/list":
-            return {
+            result = {
                 "tools": TOOLS
             }
         
@@ -475,34 +487,48 @@ async def mcp_messages(
             
             # Execute the appropriate tool
             if tool_name == "read_query":
-                result = await read_query(arguments.get("query"), config)
+                tool_result = await read_query(arguments.get("query"), config)
             elif tool_name == "list_tables":
-                result = await list_tables(
+                tool_result = await list_tables(
                     arguments.get("database"),
                     arguments.get("schema"),
                     config
                 )
             elif tool_name == "describe_table":
-                result = await describe_table(arguments.get("table_name"), config)
+                tool_result = await describe_table(arguments.get("table_name"), config)
             elif tool_name == "list_databases":
-                result = await list_databases(config)
+                tool_result = await list_databases(config)
             elif tool_name == "list_schemas":
-                result = await list_schemas(arguments.get("database"), config)
+                tool_result = await list_schemas(arguments.get("database"), config)
             else:
-                return {"error": f"Unknown tool: {tool_name}"}
+                raise ValueError(f"Unknown tool: {tool_name}")
             
-            return {
+            result = {
                 "content": [
                     {
                         "type": "text",
-                        "text": json.dumps(result)
+                        "text": json.dumps(tool_result)
                     }
                 ]
             }
         
         else:
-            return {"error": f"Unknown method: {method}"}
+            raise ValueError(f"Unknown method: {method}")
+        
+        # Return JSON-RPC response
+        return {
+            "jsonrpc": "2.0",
+            "id": request_id,
+            "result": result
+        }
     
     except Exception as e:
         logger.error(f"Error processing MCP message: {e}")
-        return {"error": str(e)}
+        return {
+            "jsonrpc": "2.0",
+            "id": request_id,
+            "error": {
+                "code": -32603,
+                "message": str(e)
+            }
+        }
