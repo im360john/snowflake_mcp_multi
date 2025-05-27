@@ -411,20 +411,29 @@ async def mcp_sse(connection_id: str, request: Request, db: Session = Depends(ge
     base_url = str(request.url).replace('/sse', '')
     messages_url = f"{base_url}/messages"
     
-    async def generate() -> AsyncGenerator[str, None]:
+    async def generate():
         """Generate SSE events"""
         try:
-            # Send initial endpoint event
-            yield f"event: endpoint\ndata: {messages_url}\n\n"
+            logger.info(f"Starting SSE stream for connection: {connection_id}")
             
-            # Keep connection alive
+            # Send initial endpoint event immediately
+            yield f"event: endpoint\ndata: {messages_url}\n\n"
+            logger.info(f"Sent endpoint event: {messages_url}")
+            
+            # Send a heartbeat every 10 seconds to keep connection alive
+            counter = 0
             while True:
-                await asyncio.sleep(30)
-                yield f"event: ping\ndata: \n\n"
+                await asyncio.sleep(10)
+                counter += 1
+                yield f"event: heartbeat\ndata: {counter}\n\n"
+                logger.debug(f"Sent heartbeat {counter} for connection {connection_id}")
                 
         except asyncio.CancelledError:
-            logger.info(f"SSE connection closed for {connection_id}")
+            logger.info(f"SSE connection cancelled for {connection_id}")
             return
+        except Exception as e:
+            logger.error(f"Error in SSE stream: {e}")
+            yield f"event: error\ndata: {str(e)}\n\n"
     
     return StreamingResponse(
         generate(),
@@ -434,6 +443,8 @@ async def mcp_sse(connection_id: str, request: Request, db: Session = Depends(ge
             "Connection": "keep-alive",
             "X-Accel-Buffering": "no",
             "Access-Control-Allow-Origin": "*",
+            "Access-Control-Allow-Headers": "*",
+            "Access-Control-Allow-Methods": "*",
         }
     )
 
