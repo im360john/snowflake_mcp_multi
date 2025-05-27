@@ -93,6 +93,15 @@ async def read_query(query: str, config: dict) -> Dict[str, Any]:
     try:
         conn = get_snowflake_connection(config)
         cursor = conn.cursor()
+        
+        # Log the query being executed
+        logger.info(f"Executing query: {query}")
+        
+        # Ensure we're using the correct database and schema context
+        cursor.execute(f"USE DATABASE {config['database']}")
+        cursor.execute(f"USE SCHEMA {config['schema']}")
+        
+        # Execute the actual query
         cursor.execute(query)
         
         # Get column names
@@ -109,11 +118,23 @@ async def read_query(query: str, config: dict) -> Dict[str, Any]:
         return {
             "success": True,
             "data": data,
-            "row_count": len(data)
+            "row_count": len(data),
+            "query": query,
+            "database": config['database'],
+            "schema": config['schema']
         }
     except Exception as e:
         logger.error(f"Query error: {e}")
-        return {"error": str(e)}
+        error_msg = str(e)
+        
+        # Provide helpful error message if it's a schema issue
+        if "does not exist or not authorized" in error_msg:
+            return {
+                "error": error_msg,
+                "hint": f"Make sure the table exists in {config['database']}.{config['schema']}. You may need to use the fully qualified name: {config['database']}.{config['schema']}.table_name"
+            }
+        
+        return {"error": error_msg}
 
 async def list_tables(database: Optional[str], schema: Optional[str], config: dict) -> Dict[str, Any]:
     """List tables in the specified database and schema"""
@@ -221,13 +242,13 @@ async def list_schemas(database: Optional[str], config: dict) -> Dict[str, Any]:
 TOOLS = [
     {
         "name": "read_query",
-        "description": "Execute a SELECT query on Snowflake database",
+        "description": "Execute a SELECT query on Snowflake database. The query will run in the context of the configured database and schema. You can use simple table names (e.g., 'ticketline_sales') or fully qualified names (e.g., 'RETAIL_ANALYTICS.DBT_TICKET.ticketline_sales').",
         "inputSchema": {
             "type": "object",
             "properties": {
                 "query": {
                     "type": "string", 
-                    "description": "The SELECT SQL query to execute"
+                    "description": "The SELECT SQL query to execute. Table names can be simple (uses default schema) or fully qualified."
                 }
             },
             "required": ["query"]
