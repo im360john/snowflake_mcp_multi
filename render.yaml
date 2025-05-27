@@ -1,4 +1,8 @@
 services:
+  # PostgreSQL Database
+  - type: pserv
+    name: snowflake-mcp-db
+
   # Backend API
   - type: web
     name: snowflake-mcp-backend
