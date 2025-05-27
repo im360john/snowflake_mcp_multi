@@ -12,9 +12,21 @@ import snowflake.connector
 from datetime import datetime
 import uuid
 import io
+from decimal import Decimal
 
 from .database import SessionLocal, engine
 from .models import Base, SnowflakeConnection, ConnectionCreate, ConnectionResponse
+
+# Custom JSON encoder for Snowflake data types
+class SnowflakeJSONEncoder(json.JSONEncoder):
+    def default(self, obj):
+        if isinstance(obj, Decimal):
+            return float(obj)
+        elif isinstance(obj, datetime):
+            return obj.isoformat()
+        elif isinstance(obj, bytes):
+            return obj.decode('utf-8', errors='ignore')
+        return super().default(obj)
 
 # Set up logging
 logging.basicConfig(level=logging.INFO)
@@ -110,19 +122,33 @@ async def read_query(query: str, config: dict) -> Dict[str, Any]:
         # Fetch results
         results = cursor.fetchall()
         
-        # Convert to list of dicts
-        data = [dict(zip(columns, [str(v) if isinstance(v, (datetime, bytes)) else v for v in row])) for row in results]
+        # Convert to list of dicts with proper type handling
+        data = []
+        for row in results:
+            row_dict = {}
+            for i, value in enumerate(row):
+                if isinstance(value, Decimal):
+                    row_dict[columns[i]] = float(value)
+                elif isinstance(value, datetime):
+                    row_dict[columns[i]] = value.isoformat()
+                elif isinstance(value, bytes):
+                    row_dict[columns[i]] = value.decode('utf-8', errors='ignore')
+                else:
+                    row_dict[columns[i]] = value
+            data.append(row_dict)
         
         cursor.close()
         
-        return {
+        result = {
             "success": True,
             "data": data,
             "row_count": len(data),
-            "query": query,
-            "database": config['database'],
-            "schema": config['schema']
+            "columns": columns
         }
+        
+        # Ensure the result is JSON serializable
+        return json.loads(json.dumps(result, cls=SnowflakeJSONEncoder))
+        
     except Exception as e:
         logger.error(f"Query error: {e}")
         error_msg = str(e)
@@ -223,13 +249,27 @@ async def list_databases(config: dict) -> Dict[str, Any]:
         databases = cursor.fetchall()
         cursor.close()
         
-        return {
+        # Convert to simple list with proper type handling
+        db_list = []
+        for db in databases:
+            # db[1] is the database name, db[0] is created timestamp
+            db_list.append({
+                "name": db[1],
+                "created": db[0].isoformat() if isinstance(db[0], datetime) else str(db[0])
+            })
+        
+        result = {
             "success": True,
-            "databases": [{"name": db[1]} for db in databases]
+            "databases": db_list,
+            "count": len(db_list)
         }
+        
+        # Ensure JSON serializable
+        return json.loads(json.dumps(result, cls=SnowflakeJSONEncoder))
+        
     except Exception as e:
         logger.error(f"List databases error: {e}")
-        return {"error": str(e)}
+        return {"success": False, "error": str(e)}
 
 async def list_schemas(database: Optional[str], config: dict) -> Dict[str, Any]:
     """List all schemas in a database"""
@@ -668,7 +708,7 @@ async def mcp_messages(
                 "content": [
                     {
                         "type": "text",
-                        "text": json.dumps(tool_result, indent=2)
+                        "text": json.dumps(tool_result, indent=2, cls=SnowflakeJSONEncoder)
                     }
                 ]
             }
