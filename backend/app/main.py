@@ -5,6 +5,10 @@ from contextlib import asynccontextmanager
 from typing import List
 import os
 import logging
+import asyncio
+import json
+import httpx
+from sse_starlette import EventSourceResponse
 
 from .database import SessionLocal, engine
 from .models import Base, SnowflakeConnection, ConnectionCreate, ConnectionResponse
@@ -13,6 +17,9 @@ from .connection_manager import ConnectionManager
 # Set up logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+# Configuration
+API_BASE_URL = os.getenv("API_BASE_URL", "https://snowflake-mcp-backend.onrender.com")
 
 # Global connection manager
 connection_manager = ConnectionManager()
@@ -99,7 +106,7 @@ async def create_connection(
             id=db_connection.id,
             name=db_connection.name,
             account=db_connection.account,
-            sse_endpoint=f"http://localhost:{port}/sse",
+            sse_endpoint=f"{API_BASE_URL}/mcp/{db_connection.id}/sse",
             active=db_connection.active,
             created_at=db_connection.created_at
         )
@@ -120,7 +127,7 @@ async def list_connections(db: Session = Depends(get_db)):
             id=conn.id,
             name=conn.name,
             account=conn.account,
-            sse_endpoint=f"http://localhost:{conn.port}/sse" if conn.port else "",
+            sse_endpoint=f"{API_BASE_URL}/mcp/{conn.id}/sse" if conn.active else "",
             active=conn.active,
             created_at=conn.created_at
         )
@@ -193,7 +200,7 @@ async def start_connection(
         
         return {
             "message": "Connection started",
-            "sse_endpoint": f"http://localhost:{port}/sse"
+            "sse_endpoint": f"{API_BASE_URL}/mcp/{connection_id}/sse"
         }
     except Exception as e:
         logger.error(f"Failed to start connection: {e}")
@@ -221,3 +228,81 @@ async def stop_connection(
     
     logger.info(f"Connection {connection_id} stopped successfully")
     return {"message": "Connection stopped"}
+
+# MCP Proxy Endpoints
+@app.get("/mcp/{connection_id}/sse")
+async def proxy_sse(connection_id: str, db: Session = Depends(get_db)):
+    """Proxy SSE connection to the appropriate MCP server"""
+    # Get connection from database
+    conn = db.query(SnowflakeConnection).filter(
+        SnowflakeConnection.id == connection_id
+    ).first()
+    
+    if not conn or not conn.active:
+        raise HTTPException(status_code=404, detail="Connection not found or not active")
+    
+    logger.info(f"Establishing SSE connection for {connection_id}")
+    
+    # Create event generator
+    async def event_generator():
+        # Send initial connection event
+        yield {
+            "event": "open",
+            "data": json.dumps({
+                "protocol": "mcp",
+                "version": "1.0.0",
+                "capabilities": {
+                    "tools": True
+                }
+            })
+        }
+        
+        # Keep connection alive
+        try:
+            while True:
+                await asyncio.sleep(30)
+                yield {
+                    "event": "ping",
+                    "data": json.dumps({"type": "ping"})
+                }
+        except asyncio.CancelledError:
+            logger.info(f"SSE connection closed for {connection_id}")
+            pass
+    
+    return EventSourceResponse(event_generator())
+
+@app.post("/mcp/{connection_id}/messages")
+async def proxy_messages(
+    connection_id: str, 
+    request: dict,
+    db: Session = Depends(get_db)
+):
+    """Proxy messages to the appropriate MCP server"""
+    # Get connection from database
+    conn = db.query(SnowflakeConnection).filter(
+        SnowflakeConnection.id == connection_id
+    ).first()
+    
+    if not conn or not conn.active:
+        raise HTTPException(status_code=404, detail="Connection not found or not active")
+    
+    logger.info(f"Proxying message to {connection_id}: {request.get('method')}")
+    
+    # Forward to the internal MCP server
+    async with httpx.AsyncClient() as client:
+        try:
+            response = await client.post(
+                f"http://localhost:{conn.port}/messages",
+                json=request,
+                timeout=30.0
+            )
+            return response.json()
+        except httpx.ConnectError:
+            logger.error(f"Failed to connect to internal MCP server on port {conn.port}")
+            raise HTTPException(
+                status_code=503, 
+                detail="Internal MCP server not reachable. Try restarting the connection."
+            )
+        except Exception as e:
+            logger.error(f"Error proxying message: {e}")
+            raise HTTPException(status_code=500, detail=str(e))
