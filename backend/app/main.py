@@ -151,13 +151,26 @@ async def list_tables(database: Optional[str], schema: Optional[str], config: di
         tables = cursor.fetchall()
         cursor.close()
         
+        # Return a simple list of table names for better compatibility
+        table_list = []
+        for t in tables:
+            table_list.append({
+                "name": t[1],
+                "database": t[0],
+                "schema": t[2] if len(t) > 2 else sch,
+                "type": t[3] if len(t) > 3 else "TABLE"
+            })
+        
         return {
             "success": True,
-            "tables": [{"name": t[1], "database": t[0], "schema": t[2]} for t in tables]
+            "tables": table_list,
+            "count": len(table_list),
+            "database": db,
+            "schema": sch
         }
     except Exception as e:
         logger.error(f"List tables error: {e}")
-        return {"error": str(e)}
+        return {"success": False, "error": str(e)}
 
 async def describe_table(table_name: str, config: dict) -> Dict[str, Any]:
     """Get column information for a table"""
@@ -242,13 +255,13 @@ async def list_schemas(database: Optional[str], config: dict) -> Dict[str, Any]:
 TOOLS = [
     {
         "name": "read_query",
-        "description": "Execute a SELECT query on Snowflake database. The query will run in the context of the configured database and schema. You can use simple table names (e.g., 'ticketline_sales') or fully qualified names (e.g., 'RETAIL_ANALYTICS.DBT_TICKET.ticketline_sales').",
+        "description": "Execute a SELECT query on Snowflake database. When querying tables, use just the table name (e.g., 'SELECT * FROM ticketline_sales') unless you need to query from a different schema. The current schema context is automatically set.",
         "inputSchema": {
             "type": "object",
             "properties": {
                 "query": {
                     "type": "string", 
-                    "description": "The SELECT SQL query to execute. Table names can be simple (uses default schema) or fully qualified."
+                    "description": "The SELECT SQL query to execute. Use simple table names like 'ticketline_sales' not schema names."
                 }
             },
             "required": ["query"]
@@ -256,17 +269,17 @@ TOOLS = [
     },
     {
         "name": "list_tables",
-        "description": "Return list of tables that available for data in snowflake database. This is usually first this agent shall call.",
+        "description": "List all tables available in the Snowflake database and schema. Call this first to see what tables are available to query.",
         "inputSchema": {
             "type": "object",
             "properties": {
                 "database": {
                     "type": "string", 
-                    "description": "Database name (optional)"
+                    "description": "Database name (optional, uses configured default)"
                 },
                 "schema": {
                     "type": "string", 
-                    "description": "Schema name (optional)"
+                    "description": "Schema name (optional, uses configured default)"
                 }
             },
             "required": []
@@ -274,13 +287,13 @@ TOOLS = [
     },
     {
         "name": "describe_table",
-        "description": "Discover data structure for connected snowflake gateway. table_name parameter is the fully qualified table name.",
+        "description": "Get column information for a specific table. Use just the table name unless querying from a different schema.",
         "inputSchema": {
             "type": "object",
             "properties": {
                 "table_name": {
                     "type": "string", 
-                    "description": "Table name (can be fully qualified like database.schema.table)"
+                    "description": "Table name (e.g., 'ticketline_sales'). Can include schema if needed (e.g., 'other_schema.table_name')"
                 }
             },
             "required": ["table_name"]
@@ -303,7 +316,7 @@ TOOLS = [
             "properties": {
                 "database": {
                     "type": "string", 
-                    "description": "Database name (optional, uses default if not provided)"
+                    "description": "Database name (optional, uses configured default)"
                 }
             },
             "required": []
