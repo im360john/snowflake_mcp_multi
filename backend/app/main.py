@@ -646,8 +646,8 @@ async def mcp_messages(
             return Response(status_code=202)  # Accepted
         
         elif method == "ping":
-            # Handle ping requests
-            result = {"pong": True}
+            # Handle ping requests - LibreChat expects empty result
+            result = {}
         
         else:
             # Send error through SSE for unknown methods
