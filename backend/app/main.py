@@ -2,12 +2,13 @@ from fastapi import FastAPI, HTTPException, Depends
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy.orm import Session
 from contextlib import asynccontextmanager
-from typing import List
+from typing import List, Dict, Any, Optional
 import os
 import logging
 import asyncio
 import json
-import httpx
+import snowflake.connector
+from datetime import datetime
 from sse_starlette import EventSourceResponse
 
 from .database import SessionLocal, engine
@@ -24,6 +25,9 @@ API_BASE_URL = os.getenv("API_BASE_URL", "https://snowflake-mcp-backend.onrender
 # Global connection manager
 connection_manager = ConnectionManager()
 
+# Store Snowflake connections
+snowflake_connections: Dict[str, Any] = {}
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # Startup
@@ -35,10 +39,13 @@ async def lifespan(app: FastAPI):
     
     yield
     
-    # Shutdown - stop all MCP servers
+    # Shutdown - close all Snowflake connections
     logger.info("Shutting down...")
-    for conn_id in list(connection_manager.active_servers.keys()):
-        await connection_manager.stop_connection(conn_id)
+    for conn_id in list(snowflake_connections.keys()):
+        try:
+            snowflake_connections[conn_id].close()
+        except:
+            pass
 
 app = FastAPI(title="Snowflake MCP Manager", lifespan=lifespan)
 
@@ -57,6 +64,212 @@ def get_db():
         yield db
     finally:
         db.close()
+
+def get_snowflake_connection(config: dict) -> snowflake.connector.SnowflakeConnection:
+    """Get or create a Snowflake connection"""
+    conn_id = config.get('id', 'default')
+    
+    if conn_id not in snowflake_connections or snowflake_connections[conn_id].is_closed():
+        logger.info(f"Creating new Snowflake connection for {conn_id}")
+        snowflake_connections[conn_id] = snowflake.connector.connect(
+            user=config['user'],
+            password=config['password'],
+            account=config['account'],
+            warehouse=config['warehouse'],
+            database=config['database'],
+            schema=config['schema'],
+            role=config['role']
+        )
+    
+    return snowflake_connections[conn_id]
+
+# MCP Tool implementations
+async def read_query(query: str, config: dict) -> Dict[str, Any]:
+    """Execute a SELECT query on Snowflake"""
+    if not query.strip().upper().startswith('SELECT'):
+        return {"error": "Only SELECT queries are allowed"}
+    
+    try:
+        conn = get_snowflake_connection(config)
+        cursor = conn.cursor()
+        cursor.execute(query)
+        
+        # Get column names
+        columns = [desc[0] for desc in cursor.description]
+        
+        # Fetch results
+        results = cursor.fetchall()
+        
+        # Convert to list of dicts
+        data = [dict(zip(columns, [str(v) if isinstance(v, (datetime, bytes)) else v for v in row])) for row in results]
+        
+        cursor.close()
+        
+        return {
+            "success": True,
+            "data": data,
+            "row_count": len(data)
+        }
+    except Exception as e:
+        logger.error(f"Query error: {e}")
+        return {"error": str(e)}
+
+async def list_tables(database: Optional[str], schema: Optional[str], config: dict) -> Dict[str, Any]:
+    """List tables in the specified database and schema"""
+    try:
+        db = database or config['database']
+        sch = schema or config['schema']
+        
+        query = f"SHOW TABLES IN {db}.{sch}"
+        
+        conn = get_snowflake_connection(config)
+        cursor = conn.cursor()
+        cursor.execute(query)
+        
+        tables = cursor.fetchall()
+        cursor.close()
+        
+        return {
+            "success": True,
+            "tables": [{"name": t[1], "database": t[0], "schema": t[2]} for t in tables]
+        }
+    except Exception as e:
+        logger.error(f"List tables error: {e}")
+        return {"error": str(e)}
+
+async def describe_table(table_name: str, config: dict) -> Dict[str, Any]:
+    """Get column information for a table"""
+    try:
+        # Parse table name (could be fully qualified)
+        parts = table_name.split('.')
+        if len(parts) == 3:
+            db, schema, table = parts
+        elif len(parts) == 2:
+            db = config['database']
+            schema, table = parts
+        else:
+            db = config['database']
+            schema = config['schema']
+            table = table_name
+        
+        query = f"DESCRIBE TABLE {db}.{schema}.{table}"
+        
+        conn = get_snowflake_connection(config)
+        cursor = conn.cursor()
+        cursor.execute(query)
+        
+        columns = cursor.fetchall()
+        cursor.close()
+        
+        return {
+            "success": True,
+            "columns": [
+                {
+                    "name": col[0],
+                    "type": col[1],
+                    "nullable": col[2] == 'Y',
+                    "default": col[3],
+                    "comment": col[8] if len(col) > 8 else None
+                }
+                for col in columns
+            ]
+        }
+    except Exception as e:
+        logger.error(f"Describe table error: {e}")
+        return {"error": str(e)}
+
+async def list_databases(config: dict) -> Dict[str, Any]:
+    """List all databases"""
+    try:
+        conn = get_snowflake_connection(config)
+        cursor = conn.cursor()
+        cursor.execute("SHOW DATABASES")
+        
+        databases = cursor.fetchall()
+        cursor.close()
+        
+        return {
+            "success": True,
+            "databases": [{"name": db[1]} for db in databases]
+        }
+    except Exception as e:
+        logger.error(f"List databases error: {e}")
+        return {"error": str(e)}
+
+async def list_schemas(database: Optional[str], config: dict) -> Dict[str, Any]:
+    """List all schemas in a database"""
+    try:
+        db = database or config['database']
+        
+        conn = get_snowflake_connection(config)
+        cursor = conn.cursor()
+        cursor.execute(f"SHOW SCHEMAS IN DATABASE {db}")
+        
+        schemas = cursor.fetchall()
+        cursor.close()
+        
+        return {
+            "success": True,
+            "schemas": [{"name": s[1], "database": db} for s in schemas]
+        }
+    except Exception as e:
+        logger.error(f"List schemas error: {e}")
+        return {"error": str(e)}
+
+# Tool definitions
+TOOLS = [
+    {
+        "name": "read_query",
+        "description": "Execute a SELECT query on Snowflake",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "query": {"type": "string", "description": "The SELECT SQL query to execute"}
+            },
+            "required": ["query"]
+        }
+    },
+    {
+        "name": "list_tables",
+        "description": "List tables in the specified database and schema",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "database": {"type": "string", "description": "Database name"},
+                "schema": {"type": "string", "description": "Schema name"}
+            }
+        }
+    },
+    {
+        "name": "describe_table",
+        "description": "Get column information for a table",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "table_name": {"type": "string", "description": "Table name (can be fully qualified)"}
+            },
+            "required": ["table_name"]
+        }
+    },
+    {
+        "name": "list_databases",
+        "description": "List all databases",
+        "inputSchema": {
+            "type": "object",
+            "properties": {}
+        }
+    },
+    {
+        "name": "list_schemas",
+        "description": "List all schemas in a database",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "database": {"type": "string", "description": "Database name"}
+            }
+        }
+    }
+]
 
 @app.get("/")
 async def root():
@@ -88,19 +301,20 @@ async def create_connection(
     db.commit()
     db.refresh(db_connection)
     
-    # Start MCP server
+    # Test the connection
     try:
-        port = await connection_manager.start_connection(
-            db_connection.id,
-            connection.dict()
-        )
+        config = connection.dict()
+        config['id'] = db_connection.id
+        conn = get_snowflake_connection(config)
+        cursor = conn.cursor()
+        cursor.execute("SELECT CURRENT_VERSION()")
+        cursor.fetchone()
+        cursor.close()
         
-        # Update connection with port
-        db_connection.port = port
         db_connection.active = True
         db.commit()
         
-        logger.info(f"Connection {connection.name} created successfully on port {port}")
+        logger.info(f"Connection {connection.name} created successfully")
         
         return ConnectionResponse(
             id=db_connection.id,
@@ -111,10 +325,10 @@ async def create_connection(
             created_at=db_connection.created_at
         )
     except Exception as e:
-        logger.error(f"Failed to start MCP server: {e}")
+        logger.error(f"Failed to connect to Snowflake: {e}")
         db.delete(db_connection)
         db.commit()
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=400, detail=f"Failed to connect to Snowflake: {str(e)}")
 
 @app.get("/connections", response_model=List[ConnectionResponse])
 async def list_connections(db: Session = Depends(get_db)):
@@ -149,8 +363,13 @@ async def delete_connection(
     if not conn:
         raise HTTPException(status_code=404, detail="Connection not found")
     
-    # Stop MCP server
-    await connection_manager.stop_connection(connection_id)
+    # Close Snowflake connection if exists
+    if connection_id in snowflake_connections:
+        try:
+            snowflake_connections[connection_id].close()
+            del snowflake_connections[connection_id]
+        except:
+            pass
     
     # Delete from database
     db.delete(conn)
@@ -159,80 +378,10 @@ async def delete_connection(
     logger.info(f"Connection {connection_id} deleted successfully")
     return {"message": "Connection deleted"}
 
-@app.post("/connections/{connection_id}/start")
-async def start_connection(
-    connection_id: str,
-    db: Session = Depends(get_db)
-):
-    """Start a connection's MCP server"""
-    logger.info(f"Starting connection: {connection_id}")
-    
-    conn = db.query(SnowflakeConnection).filter(
-        SnowflakeConnection.id == connection_id
-    ).first()
-    
-    if not conn:
-        raise HTTPException(status_code=404, detail="Connection not found")
-    
-    if conn.active:
-        return {"message": "Connection already active"}
-    
-    try:
-        port = await connection_manager.start_connection(
-            conn.id,
-            {
-                "name": conn.name,
-                "account": conn.account,
-                "user": conn.user,
-                "password": conn.password,
-                "warehouse": conn.warehouse,
-                "database": conn.database,
-                "schema": conn.schema,
-                "role": conn.role
-            }
-        )
-        
-        conn.port = port
-        conn.active = True
-        db.commit()
-        
-        logger.info(f"Connection {connection_id} started on port {port}")
-        
-        return {
-            "message": "Connection started",
-            "sse_endpoint": f"{API_BASE_URL}/mcp/{connection_id}/sse"
-        }
-    except Exception as e:
-        logger.error(f"Failed to start connection: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
-
-@app.post("/connections/{connection_id}/stop")
-async def stop_connection(
-    connection_id: str,
-    db: Session = Depends(get_db)
-):
-    """Stop a connection's MCP server"""
-    logger.info(f"Stopping connection: {connection_id}")
-    
-    conn = db.query(SnowflakeConnection).filter(
-        SnowflakeConnection.id == connection_id
-    ).first()
-    
-    if not conn:
-        raise HTTPException(status_code=404, detail="Connection not found")
-    
-    await connection_manager.stop_connection(connection_id)
-    
-    conn.active = False
-    db.commit()
-    
-    logger.info(f"Connection {connection_id} stopped successfully")
-    return {"message": "Connection stopped"}
-
-# MCP Proxy Endpoints
+# MCP Endpoints
 @app.get("/mcp/{connection_id}/sse")
-async def proxy_sse(connection_id: str, db: Session = Depends(get_db)):
-    """Proxy SSE connection to the appropriate MCP server"""
+async def mcp_sse(connection_id: str, db: Session = Depends(get_db)):
+    """SSE endpoint for MCP protocol"""
     # Get connection from database
     conn = db.query(SnowflakeConnection).filter(
         SnowflakeConnection.id == connection_id
@@ -272,12 +421,12 @@ async def proxy_sse(connection_id: str, db: Session = Depends(get_db)):
     return EventSourceResponse(event_generator())
 
 @app.post("/mcp/{connection_id}/messages")
-async def proxy_messages(
+async def mcp_messages(
     connection_id: str, 
     request: dict,
     db: Session = Depends(get_db)
 ):
-    """Proxy messages to the appropriate MCP server"""
+    """Handle MCP protocol messages"""
     # Get connection from database
     conn = db.query(SnowflakeConnection).filter(
         SnowflakeConnection.id == connection_id
@@ -286,23 +435,74 @@ async def proxy_messages(
     if not conn or not conn.active:
         raise HTTPException(status_code=404, detail="Connection not found or not active")
     
-    logger.info(f"Proxying message to {connection_id}: {request.get('method')}")
+    method = request.get("method")
+    params = request.get("params", {})
     
-    # Forward to the internal MCP server
-    async with httpx.AsyncClient() as client:
-        try:
-            response = await client.post(
-                f"http://localhost:{conn.port}/messages",
-                json=request,
-                timeout=30.0
-            )
-            return response.json()
-        except httpx.ConnectError:
-            logger.error(f"Failed to connect to internal MCP server on port {conn.port}")
-            raise HTTPException(
-                status_code=503, 
-                detail="Internal MCP server not reachable. Try restarting the connection."
-            )
-        except Exception as e:
-            logger.error(f"Error proxying message: {e}")
-            raise HTTPException(status_code=500, detail=str(e))
+    logger.info(f"Processing MCP message for {connection_id}: {method}")
+    
+    # Build config for Snowflake connection
+    config = {
+        'id': conn.id,
+        'user': conn.user,
+        'password': conn.password,
+        'account': conn.account,
+        'warehouse': conn.warehouse,
+        'database': conn.database,
+        'schema': conn.schema,
+        'role': conn.role
+    }
+    
+    try:
+        # Handle different MCP methods
+        if method == "initialize":
+            return {
+                "protocolVersion": "1.0.0",
+                "capabilities": {
+                    "tools": {
+                        "listChanged": False
+                    }
+                }
+            }
+        
+        elif method == "tools/list":
+            return {
+                "tools": TOOLS
+            }
+        
+        elif method == "tools/call":
+            tool_name = params.get("name")
+            arguments = params.get("arguments", {})
+            
+            # Execute the appropriate tool
+            if tool_name == "read_query":
+                result = await read_query(arguments.get("query"), config)
+            elif tool_name == "list_tables":
+                result = await list_tables(
+                    arguments.get("database"),
+                    arguments.get("schema"),
+                    config
+                )
+            elif tool_name == "describe_table":
+                result = await describe_table(arguments.get("table_name"), config)
+            elif tool_name == "list_databases":
+                result = await list_databases(config)
+            elif tool_name == "list_schemas":
+                result = await list_schemas(arguments.get("database"), config)
+            else:
+                return {"error": f"Unknown tool: {tool_name}"}
+            
+            return {
+                "content": [
+                    {
+                        "type": "text",
+                        "text": json.dumps(result)
+                    }
+                ]
+            }
+        
+        else:
+            return {"error": f"Unknown method: {method}"}
+    
+    except Exception as e:
+        logger.error(f"Error processing MCP message: {e}")
+        return {"error": str(e)}
