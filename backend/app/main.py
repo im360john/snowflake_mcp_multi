@@ -13,7 +13,6 @@ from sse_starlette import EventSourceResponse
 
 from .database import SessionLocal, engine
 from .models import Base, SnowflakeConnection, ConnectionCreate, ConnectionResponse
-from .connection_manager import ConnectionManager
 
 # Set up logging
 logging.basicConfig(level=logging.INFO)
@@ -21,9 +20,6 @@ logger = logging.getLogger(__name__)
 
 # Configuration
 API_BASE_URL = os.getenv("API_BASE_URL", "https://snowflake-mcp-backend.onrender.com")
-
-# Global connection manager
-connection_manager = ConnectionManager()
 
 # Store Snowflake connections
 snowflake_connections: Dict[str, Any] = {}
@@ -396,7 +392,7 @@ async def delete_connection(
     logger.info(f"Connection {connection_id} deleted successfully")
     return {"message": "Connection deleted"}
 
-# MCP SSE Endpoint - CRITICAL FIX HERE
+# MCP SSE Endpoint
 @app.get("/mcp/{connection_id}/sse")
 async def mcp_sse(connection_id: str, request: Request, db: Session = Depends(get_db)):
     """SSE endpoint for MCP protocol"""
