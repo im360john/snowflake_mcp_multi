@@ -2,15 +2,13 @@ services:
   # PostgreSQL Database
   - type: pserv
     name: snowflake-mcp-db
-    plan: starter
 
   # Backend API
   - type: web
     name: snowflake-mcp-backend
-    plan: starter
     env: python
     buildCommand: "pip install -r backend/requirements.txt"
-    startCommand: "cd backend && uvicorn app.main:app --host 0.0.0.0 --port $PORT"
+    startCommand: "cd backend && python -m uvicorn app.main:app --host 0.0.0.0 --port $PORT"
     envVars:
       - key: DATABASE_URL
         fromDatabase:
@@ -18,20 +16,23 @@ services:
           property: connectionString
       - key: SECRET_KEY
         generateValue: true
-      - key: PORT_RANGE_START
-        value: "8100"
-      - key: PORT_RANGE_END
-        value: "8200"
       - key: PYTHON_VERSION
         value: "3.11"
 
-  # Frontend (using static site instead of Docker)
+  # Frontend
   - type: web
     name: snowflake-mcp-frontend
-    plan: starter
     env: static
     buildCommand: "cd frontend && npm install && npm run build"
     staticPublishPath: ./frontend/build
+    headers:
+      - path: /*
+        name: X-Frame-Options
+        value: SAMEORIGIN
+    routes:
+      - type: rewrite
+        source: /*
+        destination: /index.html
     envVars:
       - key: REACT_APP_API_URL
         fromService:
