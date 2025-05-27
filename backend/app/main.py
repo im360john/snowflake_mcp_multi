@@ -397,10 +397,13 @@ async def delete_connection(
     logger.info(f"Connection {connection_id} deleted successfully")
     return {"message": "Connection deleted"}
 
-# MCP SSE Endpoint - Optimized for Claude and Render
+# Store message queues for each SSE session
+message_queues: Dict[str, asyncio.Queue] = {}
+
+# MCP SSE Endpoint - Optimized for LibreChat SSE transport
 @app.get("/mcp/{connection_id}/sse")
 async def mcp_sse(connection_id: str, request: Request, db: Session = Depends(get_db)):
-    """SSE endpoint for MCP protocol - optimized for Claude client and Render deployment"""
+    """SSE endpoint for MCP protocol - optimized for LibreChat SSE transport"""
     logger.info(f"SSE endpoint called for connection: {connection_id}")
     logger.info(f"User-Agent: {request.headers.get('user-agent', 'Unknown')}")
     
@@ -415,67 +418,78 @@ async def mcp_sse(connection_id: str, request: Request, db: Session = Depends(ge
     # Generate unique session ID for this SSE connection
     session_id = str(uuid.uuid4())
     
+    # Create a message queue for this session
+    message_queue = asyncio.Queue()
+    message_queues[connection_id] = message_queue
+    
     # Get the full URL for the messages endpoint
     base_url = str(request.url).replace('/sse', '')
     messages_url = f"{base_url}/messages"
     
     async def event_stream() -> AsyncGenerator[bytes, None]:
-        """Generate SSE events optimized for Claude client"""
+        """Generate SSE events for LibreChat SSE transport"""
         # Track this connection
         active_sse_connections[session_id] = {
             "connection_id": connection_id,
             "started_at": datetime.now(),
-            "last_heartbeat": datetime.now()
+            "last_heartbeat": datetime.now(),
+            "message_queue": message_queue
         }
         
         try:
             logger.info(f"Starting SSE stream for connection: {connection_id}, session: {session_id}")
             
-            # CRITICAL: Send the endpoint URL immediately as the first event
-            # Claude expects this specific format
+            # Send the endpoint URL as required by MCP SSE transport
             yield f"event: endpoint\ndata: {messages_url}\n\n".encode('utf-8')
             logger.info(f"Sent endpoint URL: {messages_url}")
             
-            # Send a flush comment to ensure data is sent immediately
-            yield b":ok\n\n"
+            # Start tasks for heartbeat and message handling
+            async def heartbeat_sender():
+                """Send periodic heartbeats"""
+                counter = 0
+                while session_id in active_sse_connections:
+                    await asyncio.sleep(30)
+                    counter += 1
+                    # LibreChat doesn't need frequent heartbeats
+                    logger.debug(f"Heartbeat {counter} for session {session_id}")
             
-            # Now maintain the connection with minimal heartbeats
-            heartbeat_counter = 0
+            heartbeat_task = asyncio.create_task(heartbeat_sender())
             
+            # Main loop to send queued messages
             while True:
-                # Check if client is still connected
-                if await request.is_disconnected():
-                    logger.info(f"Client disconnected for session: {session_id}")
-                    break
-                
-                # Wait 15 seconds between heartbeats (less frequent but enough to keep alive)
-                await asyncio.sleep(15)
-                
-                heartbeat_counter += 1
-                
-                # Send minimal keep-alive comment
-                yield f": hb-{heartbeat_counter}\n\n".encode('utf-8')
-                
-                # Log every 5th heartbeat
-                if heartbeat_counter % 5 == 0:
-                    logger.debug(f"Heartbeat {heartbeat_counter} for session {session_id}")
-                
-                # Update last heartbeat time
-                active_sse_connections[session_id]["last_heartbeat"] = datetime.now()
-                
+                try:
+                    # Wait for messages with a timeout
+                    message = await asyncio.wait_for(message_queue.get(), timeout=1.0)
+                    
+                    # Send the message through SSE
+                    message_str = json.dumps(message)
+                    yield f"event: message\ndata: {message_str}\n\n".encode('utf-8')
+                    logger.debug(f"Sent message through SSE: {message_str[:100]}...")
+                    
+                except asyncio.TimeoutError:
+                    # No message, check if still connected
+                    if await request.is_disconnected():
+                        logger.info(f"Client disconnected for session: {session_id}")
+                        break
+                    # Send keep-alive comment
+                    yield b": keepalive\n\n"
+                    
         except asyncio.CancelledError:
             logger.info(f"SSE connection cancelled for session: {session_id}")
             raise
         except Exception as e:
             logger.error(f"Error in SSE stream for session {session_id}: {e}", exc_info=True)
-            # Don't send error events to client as it might confuse Claude
             raise
         finally:
-            # Clean up connection tracking
+            # Cancel heartbeat task
+            if 'heartbeat_task' in locals():
+                heartbeat_task.cancel()
+            # Clean up
+            message_queues.pop(connection_id, None)
             active_sse_connections.pop(session_id, None)
             logger.info(f"SSE connection closed for session: {session_id}")
     
-    # Return streaming response with minimal headers
+    # Return streaming response
     return StreamingResponse(
         event_stream(),
         media_type="text/event-stream",
@@ -534,7 +548,7 @@ async def mcp_messages(
     request: Request,
     db: Session = Depends(get_db)
 ):
-    """Handle MCP protocol messages"""
+    """Handle MCP protocol messages - sends responses through SSE stream"""
     # Get connection from database
     conn = db.query(SnowflakeConnection).filter(
         SnowflakeConnection.id == connection_id
@@ -552,6 +566,12 @@ async def mcp_messages(
     logger.info(f"Processing MCP message for {connection_id}: {method}")
     logger.debug(f"Request body: {body}")
     
+    # Get the message queue for this connection
+    message_queue = message_queues.get(connection_id)
+    if not message_queue:
+        logger.error(f"No message queue found for connection {connection_id}")
+        return Response(status_code=503)  # Service Unavailable
+    
     # Build config for Snowflake connection
     config = {
         'id': conn.id,
@@ -568,7 +588,7 @@ async def mcp_messages(
         # Handle different MCP methods
         if method == "initialize":
             result = {
-                "protocolVersion": "2025-03-26",  # Updated to match LibreChat's version
+                "protocolVersion": "2025-03-26",  # Match LibreChat's version
                 "capabilities": {
                     "tools": {}
                 },
@@ -623,41 +643,45 @@ async def mcp_messages(
             # Handle notification cancellation - just acknowledge it
             logger.info(f"Received cancellation notification for request: {params.get('requestId')}")
             # For notifications, we don't send a response
-            return Response(status_code=204)  # No content
+            return Response(status_code=202)  # Accepted
         
         elif method == "ping":
             # Handle ping requests
             result = {"pong": True}
         
         else:
-            # Log unknown method but don't fail
-            logger.warning(f"Unknown method: {method}")
-            return {
-                "jsonrpc": "2.0",
-                "id": request_id,
-                "error": {
-                    "code": -32601,  # Method not found
-                    "message": f"Method not found: {method}"
+            # Send error through SSE for unknown methods
+            if request_id is not None:
+                error_response = {
+                    "jsonrpc": "2.0",
+                    "id": request_id,
+                    "error": {
+                        "code": -32601,
+                        "message": f"Method not found: {method}"
+                    }
                 }
-            }
+                await message_queue.put(error_response)
+            return Response(status_code=202)
         
-        # Return JSON-RPC response for methods that expect a response
+        # Send successful response through SSE stream
         if request_id is not None:
             response = {
                 "jsonrpc": "2.0",
                 "id": request_id,
                 "result": result
             }
-            logger.debug(f"Sending response: {response}")
-            return response
-        else:
-            # For notifications (no id), return 204 No Content
-            return Response(status_code=204)
+            
+            # Put the response in the queue to be sent through SSE
+            await message_queue.put(response)
+            logger.debug(f"Queued response for SSE: {response}")
+        
+        # Return 202 Accepted to indicate the request was received
+        return Response(status_code=202)
     
     except Exception as e:
         logger.error(f"Error processing MCP message: {e}", exc_info=True)
         if request_id is not None:
-            return {
+            error_response = {
                 "jsonrpc": "2.0",
                 "id": request_id,
                 "error": {
@@ -665,6 +689,5 @@ async def mcp_messages(
                     "message": str(e)
                 }
             }
-        else:
-            # For notifications that error, still return 204
-            return Response(status_code=204)
+            await message_queue.put(error_response)
+        return Response(status_code=202)
