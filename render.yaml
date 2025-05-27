@@ -16,7 +16,7 @@ services:
       - key: PORT_RANGE_END
         value: "8200"
       - key: PYTHON_VERSION
-        value: "3.11"
+        value: "3.11.0"
 
   # Frontend
   - type: web
