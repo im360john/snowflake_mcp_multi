@@ -8,7 +8,7 @@ services:
   - type: web
     name: snowflake-mcp-backend
     plan: starter
-    runtime: docker
+    env: docker  # Changed from 'runtime: docker' to 'env: docker'
     dockerfilePath: ./backend/Dockerfile
     dockerContext: ./backend
     envVars:
@@ -27,7 +27,7 @@ services:
   - type: web
     name: snowflake-mcp-frontend
     plan: starter
-    runtime: docker
+    env: docker  # Changed from 'runtime: docker' to 'env: docker'
     dockerfilePath: ./frontend/Dockerfile
     dockerContext: ./frontend
     envVars:
