@@ -1,11 +1,10 @@
 from sqlalchemy import Column, String, Integer, Boolean, DateTime, JSON
-from sqlalchemy.ext.declarative import declarative_base
 from pydantic import BaseModel, Field
 from typing import Optional, Dict
 from datetime import datetime
 import uuid
 
-Base = declarative_base()
+from .database import Base
 
 class SnowflakeConnection(Base):
     __tablename__ = "connections"
@@ -19,7 +18,7 @@ class SnowflakeConnection(Base):
     database = Column(String, nullable=False)
     schema = Column(String, nullable=False)
     role = Column(String, nullable=False)
-    port = Column(Integer, unique=True)  # Unique port for SSE endpoint
+    port = Column(Integer, unique=True, nullable=True)  # Unique port for SSE endpoint
     active = Column(Boolean, default=False)
     created_at = Column(DateTime, default=datetime.utcnow)
     config = Column(JSON, default={})
