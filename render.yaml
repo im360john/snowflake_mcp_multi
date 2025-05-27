@@ -1,0 +1,44 @@
+services:
+  # PostgreSQL Database
+  - type: pserv
+    name: snowflake-mcp-db
+    plan: starter
+    databaseName: snowflake_mcp
+    ipAllowList: []
+
+  # Backend API
+  - type: web
+    name: snowflake-mcp-backend
+    plan: starter
+    runtime: docker
+    dockerfilePath: ./backend/Dockerfile
+    dockerContext: ./backend
+    envVars:
+      - key: DATABASE_URL
+        fromDatabase:
+          name: snowflake-mcp-db
+          property: connectionString
+      - key: SECRET_KEY
+        generateValue: true
+      - key: PORT_RANGE_START
+        value: 8100
+      - key: PORT_RANGE_END
+        value: 8200
+    domains:
+      - snowflake-mcp-api.onrender.com
+
+  # Frontend
+  - type: web
+    name: snowflake-mcp-frontend
+    plan: starter
+    runtime: docker
+    dockerfilePath: ./frontend/Dockerfile
+    dockerContext: ./frontend
+    envVars:
+      - key: REACT_APP_API_URL
+        fromService:
+          type: web
+          name: snowflake-mcp-backend
+          property: host
+    domains:
+      - snowflake-mcp.onrender.com
