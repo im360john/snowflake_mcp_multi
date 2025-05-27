@@ -568,7 +568,7 @@ async def mcp_messages(
         # Handle different MCP methods
         if method == "initialize":
             result = {
-                "protocolVersion": "1.0.0",
+                "protocolVersion": "2025-03-26",  # Updated to match LibreChat's version
                 "capabilities": {
                     "tools": {}
                 },
@@ -619,26 +619,52 @@ async def mcp_messages(
                 ]
             }
         
+        elif method == "notifications/cancelled":
+            # Handle notification cancellation - just acknowledge it
+            logger.info(f"Received cancellation notification for request: {params.get('requestId')}")
+            # For notifications, we don't send a response
+            return Response(status_code=204)  # No content
+        
+        elif method == "ping":
+            # Handle ping requests
+            result = {"pong": True}
+        
         else:
-            raise ValueError(f"Unknown method: {method}")
+            # Log unknown method but don't fail
+            logger.warning(f"Unknown method: {method}")
+            return {
+                "jsonrpc": "2.0",
+                "id": request_id,
+                "error": {
+                    "code": -32601,  # Method not found
+                    "message": f"Method not found: {method}"
+                }
+            }
         
-        # Return JSON-RPC response
-        response = {
-            "jsonrpc": "2.0",
-            "id": request_id,
-            "result": result
-        }
-        
-        logger.debug(f"Sending response: {response}")
-        return response
+        # Return JSON-RPC response for methods that expect a response
+        if request_id is not None:
+            response = {
+                "jsonrpc": "2.0",
+                "id": request_id,
+                "result": result
+            }
+            logger.debug(f"Sending response: {response}")
+            return response
+        else:
+            # For notifications (no id), return 204 No Content
+            return Response(status_code=204)
     
     except Exception as e:
         logger.error(f"Error processing MCP message: {e}", exc_info=True)
-        return {
-            "jsonrpc": "2.0",
-            "id": request_id,
-            "error": {
-                "code": -32603,
-                "message": str(e)
+        if request_id is not None:
+            return {
+                "jsonrpc": "2.0",
+                "id": request_id,
+                "error": {
+                    "code": -32603,
+                    "message": str(e)
+                }
             }
-        }
+        else:
+            # For notifications that error, still return 204
+            return Response(status_code=204)
