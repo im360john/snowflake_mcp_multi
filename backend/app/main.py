@@ -4,13 +4,15 @@ from sqlalchemy.orm import Session
 from contextlib import asynccontextmanager
 from typing import List
 import os
+import logging
 
-from .database import SessionLocal, engine, Base
-from .models import SnowflakeConnection, ConnectionCreate, ConnectionResponse
+from .database import SessionLocal, engine
+from .models import Base, SnowflakeConnection, ConnectionCreate, ConnectionResponse
 from .connection_manager import ConnectionManager
 
-# Create tables
-Base.metadata.create_all(bind=engine)
+# Set up logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 # Global connection manager
 connection_manager = ConnectionManager()
@@ -18,8 +20,16 @@ connection_manager = ConnectionManager()
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # Startup
+    logger.info("Starting up...")
+    # Create tables
+    logger.info("Creating database tables...")
+    Base.metadata.create_all(bind=engine)
+    logger.info("Database tables created successfully")
+    
     yield
+    
     # Shutdown - stop all MCP servers
+    logger.info("Shutting down...")
     for conn_id in list(connection_manager.active_servers.keys()):
         await connection_manager.stop_connection(conn_id)
 
@@ -43,7 +53,19 @@ def get_db():
 
 @app.get("/")
 async def root():
-    return {"message": "Snowflake MCP Multi-Connection Server API"}
+    return {"message": "Snowflake MCP Multi-Connection Server API", "status": "healthy"}
+
+@app.get("/health")
+async def health_check():
+    try:
+        # Test database connection
+        db = SessionLocal()
+        db.execute("SELECT 1")
+        db.close()
+        return {"status": "healthy", "database": "connected"}
+    except Exception as e:
+        logger.error(f"Health check failed: {e}")
+        return {"status": "unhealthy", "error": str(e)}
 
 @app.post("/connections", response_model=ConnectionResponse)
 async def create_connection(
@@ -51,6 +73,8 @@ async def create_connection(
     db: Session = Depends(get_db)
 ):
     """Create a new Snowflake connection"""
+    logger.info(f"Creating connection: {connection.name}")
+    
     # Create database entry
     db_connection = SnowflakeConnection(**connection.dict())
     db.add(db_connection)
@@ -69,6 +93,8 @@ async def create_connection(
         db_connection.active = True
         db.commit()
         
+        logger.info(f"Connection {connection.name} created successfully on port {port}")
+        
         return ConnectionResponse(
             id=db_connection.id,
             name=db_connection.name,
@@ -78,6 +104,7 @@ async def create_connection(
             created_at=db_connection.created_at
         )
     except Exception as e:
+        logger.error(f"Failed to start MCP server: {e}")
         db.delete(db_connection)
         db.commit()
         raise HTTPException(status_code=500, detail=str(e))
@@ -85,6 +112,7 @@ async def create_connection(
 @app.get("/connections", response_model=List[ConnectionResponse])
 async def list_connections(db: Session = Depends(get_db)):
     """List all connections"""
+    logger.info("Listing connections")
     connections = db.query(SnowflakeConnection).all()
     
     return [
@@ -105,6 +133,8 @@ async def delete_connection(
     db: Session = Depends(get_db)
 ):
     """Delete a connection"""
+    logger.info(f"Deleting connection: {connection_id}")
+    
     conn = db.query(SnowflakeConnection).filter(
         SnowflakeConnection.id == connection_id
     ).first()
@@ -119,6 +149,7 @@ async def delete_connection(
     db.delete(conn)
     db.commit()
     
+    logger.info(f"Connection {connection_id} deleted successfully")
     return {"message": "Connection deleted"}
 
 @app.post("/connections/{connection_id}/start")
@@ -127,6 +158,8 @@ async def start_connection(
     db: Session = Depends(get_db)
 ):
     """Start a connection's MCP server"""
+    logger.info(f"Starting connection: {connection_id}")
+    
     conn = db.query(SnowflakeConnection).filter(
         SnowflakeConnection.id == connection_id
     ).first()
@@ -156,11 +189,14 @@ async def start_connection(
         conn.active = True
         db.commit()
         
+        logger.info(f"Connection {connection_id} started on port {port}")
+        
         return {
             "message": "Connection started",
             "sse_endpoint": f"http://localhost:{port}/sse"
         }
     except Exception as e:
+        logger.error(f"Failed to start connection: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/connections/{connection_id}/stop")
@@ -169,6 +205,8 @@ async def stop_connection(
     db: Session = Depends(get_db)
 ):
     """Stop a connection's MCP server"""
+    logger.info(f"Stopping connection: {connection_id}")
+    
     conn = db.query(SnowflakeConnection).filter(
         SnowflakeConnection.id == connection_id
     ).first()
@@ -181,4 +219,5 @@ async def stop_connection(
     conn.active = False
     db.commit()
     
+    logger.info(f"Connection {connection_id} stopped successfully")
     return {"message": "Connection stopped"}
