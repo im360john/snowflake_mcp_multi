@@ -220,53 +220,71 @@ async def list_schemas(database: Optional[str], config: dict) -> Dict[str, Any]:
 TOOLS = [
     {
         "name": "read_query",
-        "description": "Execute a SELECT query on Snowflake",
+        "description": "Execute a SELECT query on Snowflake database",
         "inputSchema": {
             "type": "object",
             "properties": {
-                "query": {"type": "string", "description": "The SELECT SQL query to execute"}
+                "query": {
+                    "type": "string", 
+                    "description": "The SELECT SQL query to execute"
+                }
             },
             "required": ["query"]
         }
     },
     {
         "name": "list_tables",
-        "description": "List tables in the specified database and schema",
+        "description": "Return list of tables that available for data in snowflake database. This is usually first this agent shall call.",
         "inputSchema": {
             "type": "object",
             "properties": {
-                "database": {"type": "string", "description": "Database name"},
-                "schema": {"type": "string", "description": "Schema name"}
-            }
+                "database": {
+                    "type": "string", 
+                    "description": "Database name (optional)"
+                },
+                "schema": {
+                    "type": "string", 
+                    "description": "Schema name (optional)"
+                }
+            },
+            "required": []
         }
     },
     {
         "name": "describe_table",
-        "description": "Get column information for a table",
+        "description": "Discover data structure for connected snowflake gateway. table_name parameter is the fully qualified table name.",
         "inputSchema": {
             "type": "object",
             "properties": {
-                "table_name": {"type": "string", "description": "Table name (can be fully qualified)"}
+                "table_name": {
+                    "type": "string", 
+                    "description": "Table name (can be fully qualified like database.schema.table)"
+                }
             },
             "required": ["table_name"]
         }
     },
     {
         "name": "list_databases",
-        "description": "List all databases",
+        "description": "List all available databases in Snowflake",
         "inputSchema": {
             "type": "object",
-            "properties": {}
+            "properties": {},
+            "required": []
         }
     },
     {
         "name": "list_schemas",
-        "description": "List all schemas in a database",
+        "description": "List all schemas in a specific database",
         "inputSchema": {
             "type": "object",
             "properties": {
-                "database": {"type": "string", "description": "Database name"}
-            }
+                "database": {
+                    "type": "string", 
+                    "description": "Database name (optional, uses default if not provided)"
+                }
+            },
+            "required": []
         }
     }
 ]
@@ -380,7 +398,7 @@ async def delete_connection(
 
 # MCP SSE Endpoint - CRITICAL FIX HERE
 @app.get("/mcp/{connection_id}/sse")
-async def mcp_sse(connection_id: str, db: Session = Depends(get_db)):
+async def mcp_sse(connection_id: str, request: Request, db: Session = Depends(get_db)):
     """SSE endpoint for MCP protocol"""
     # Get connection from database
     conn = db.query(SnowflakeConnection).filter(
@@ -392,33 +410,23 @@ async def mcp_sse(connection_id: str, db: Session = Depends(get_db)):
     
     logger.info(f"Establishing SSE connection for {connection_id}")
     
+    # Get the full URL for the messages endpoint
+    base_url = str(request.url).replace('/sse', '')
+    messages_url = f"{base_url}/messages"
+    
     # Create event generator
     async def event_generator():
-        # CRITICAL: Send initial endpoint event
-        # This tells the client where to POST messages
+        # CRITICAL: Send initial endpoint event with full URL
         yield {
             "event": "endpoint",
-            "data": f"/mcp/{connection_id}/messages"
-        }
-        
-        # Send a ready message
-        yield {
-            "event": "message", 
-            "data": json.dumps({
-                "jsonrpc": "2.0",
-                "method": "notification",
-                "params": {
-                    "method": "server.ready",
-                    "params": {}
-                }
-            })
+            "data": messages_url
         }
         
         # Keep connection alive with periodic pings
         try:
             while True:
                 await asyncio.sleep(30)
-                # Send ping as a comment (SSE format)
+                # Send ping
                 yield {
                     "event": "ping",
                     "data": ""
@@ -451,6 +459,7 @@ async def mcp_messages(
     request_id = body.get("id")
     
     logger.info(f"Processing MCP message for {connection_id}: {method}")
+    logger.debug(f"Request body: {body}")
     
     # Build config for Snowflake connection
     config = {
@@ -470,20 +479,26 @@ async def mcp_messages(
             result = {
                 "protocolVersion": "1.0.0",
                 "capabilities": {
-                    "tools": {
-                        "listChanged": False
-                    }
+                    "tools": {}
+                },
+                "serverInfo": {
+                    "name": f"snowflake-{conn.name}",
+                    "version": "1.0.0"
                 }
             }
         
         elif method == "tools/list":
+            # Return tools in the correct format
             result = {
                 "tools": TOOLS
             }
+            logger.info(f"Returning {len(TOOLS)} tools")
         
         elif method == "tools/call":
             tool_name = params.get("name")
             arguments = params.get("arguments", {})
+            
+            logger.info(f"Calling tool: {tool_name} with arguments: {arguments}")
             
             # Execute the appropriate tool
             if tool_name == "read_query":
@@ -503,11 +518,12 @@ async def mcp_messages(
             else:
                 raise ValueError(f"Unknown tool: {tool_name}")
             
+            # Format the result properly
             result = {
                 "content": [
                     {
                         "type": "text",
-                        "text": json.dumps(tool_result)
+                        "text": json.dumps(tool_result, indent=2)
                     }
                 ]
             }
@@ -516,14 +532,17 @@ async def mcp_messages(
             raise ValueError(f"Unknown method: {method}")
         
         # Return JSON-RPC response
-        return {
+        response = {
             "jsonrpc": "2.0",
             "id": request_id,
             "result": result
         }
+        
+        logger.debug(f"Sending response: {response}")
+        return response
     
     except Exception as e:
-        logger.error(f"Error processing MCP message: {e}")
+        logger.error(f"Error processing MCP message: {e}", exc_info=True)
         return {
             "jsonrpc": "2.0",
             "id": request_id,
