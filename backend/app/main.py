@@ -393,6 +393,55 @@ async def delete_connection(
     logger.info(f"Connection {connection_id} deleted successfully")
     return {"message": "Connection deleted"}
 
+# Alternative SSE endpoint using EventSourceResponse
+@app.get("/mcp/{connection_id}/sse-alt")
+async def mcp_sse_alt(connection_id: str, request: Request, db: Session = Depends(get_db)):
+    """Alternative SSE endpoint using EventSourceResponse"""
+    logger.info(f"Alternative SSE endpoint called for connection: {connection_id}")
+    
+    # Get connection from database
+    conn = db.query(SnowflakeConnection).filter(
+        SnowflakeConnection.id == connection_id
+    ).first()
+    
+    if not conn or not conn.active:
+        raise HTTPException(status_code=404, detail="Connection not found or not active")
+    
+    # Get the full URL for the messages endpoint
+    base_url = str(request.url).replace('/sse-alt', '')
+    messages_url = f"{base_url}/messages"
+    
+    async def event_generator():
+        try:
+            logger.info(f"Starting alternative SSE stream for connection: {connection_id}")
+            
+            # Send initial endpoint event
+            yield {
+                "event": "endpoint",
+                "data": messages_url
+            }
+            logger.info(f"Sent endpoint event: {messages_url}")
+            
+            # Send heartbeat every 5 seconds
+            counter = 0
+            while True:
+                await asyncio.sleep(5)
+                counter += 1
+                yield {
+                    "event": "heartbeat", 
+                    "data": json.dumps({
+                        "count": counter, 
+                        "timestamp": datetime.now().isoformat()
+                    })
+                }
+                logger.info(f"Sent heartbeat {counter} for connection {connection_id}")
+                
+        except asyncio.CancelledError:
+            logger.info(f"Alternative SSE connection cancelled for {connection_id}")
+            return
+    
+    return EventSourceResponse(event_generator())
+
 # MCP SSE Endpoint
 @app.get("/mcp/{connection_id}/sse")
 async def mcp_sse(connection_id: str, request: Request, db: Session = Depends(get_db)):
@@ -411,40 +460,45 @@ async def mcp_sse(connection_id: str, request: Request, db: Session = Depends(ge
     base_url = str(request.url).replace('/sse', '')
     messages_url = f"{base_url}/messages"
     
-    async def generate():
-        """Generate SSE events"""
+    async def event_stream():
+        """Generate SSE events with proper formatting"""
         try:
             logger.info(f"Starting SSE stream for connection: {connection_id}")
             
-            # Send initial endpoint event immediately
-            yield f"event: endpoint\ndata: {messages_url}\n\n"
+            # Send initial endpoint event immediately with explicit formatting
+            event_data = f"event: endpoint\ndata: {messages_url}\n\n"
+            yield event_data.encode('utf-8')
             logger.info(f"Sent endpoint event: {messages_url}")
             
-            # Send a heartbeat every 10 seconds to keep connection alive
+            # Send heartbeat every 5 seconds to keep connection alive
             counter = 0
             while True:
-                await asyncio.sleep(10)
+                await asyncio.sleep(5)
                 counter += 1
-                yield f"event: heartbeat\ndata: {counter}\n\n"
-                logger.debug(f"Sent heartbeat {counter} for connection {connection_id}")
+                heartbeat_data = f"event: heartbeat\ndata: {{\"count\": {counter}, \"timestamp\": \"{datetime.now().isoformat()}\"}}\n\n"
+                yield heartbeat_data.encode('utf-8')
+                logger.info(f"Sent heartbeat {counter} for connection {connection_id}")
                 
         except asyncio.CancelledError:
             logger.info(f"SSE connection cancelled for {connection_id}")
             return
         except Exception as e:
             logger.error(f"Error in SSE stream: {e}")
-            yield f"event: error\ndata: {str(e)}\n\n"
+            error_data = f"event: error\ndata: {{\"error\": \"{str(e)}\"}}\n\n"
+            yield error_data.encode('utf-8')
     
     return StreamingResponse(
-        generate(),
-        media_type="text/event-stream",
+        event_stream(),
+        media_type="text/event-stream; charset=utf-8",
         headers={
-            "Cache-Control": "no-cache",
+            "Cache-Control": "no-cache, no-store, must-revalidate",
+            "Pragma": "no-cache",
+            "Expires": "0",
             "Connection": "keep-alive",
             "X-Accel-Buffering": "no",
             "Access-Control-Allow-Origin": "*",
-            "Access-Control-Allow-Headers": "*",
-            "Access-Control-Allow-Methods": "*",
+            "Access-Control-Allow-Headers": "Cache-Control",
+            "Access-Control-Allow-Methods": "GET, OPTIONS",
         }
     )
 
