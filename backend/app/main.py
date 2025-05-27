@@ -11,6 +11,7 @@ import json
 import snowflake.connector
 from datetime import datetime
 import uuid
+import io
 
 from .database import SessionLocal, engine
 from .models import Base, SnowflakeConnection, ConnectionCreate, ConnectionResponse
@@ -396,10 +397,10 @@ async def delete_connection(
     logger.info(f"Connection {connection_id} deleted successfully")
     return {"message": "Connection deleted"}
 
-# MCP SSE Endpoint - Optimized for Render
+# MCP SSE Endpoint - Fixed for Render
 @app.get("/mcp/{connection_id}/sse")
 async def mcp_sse(connection_id: str, request: Request, db: Session = Depends(get_db)):
-    """SSE endpoint for MCP protocol - optimized for Render deployment"""
+    """SSE endpoint for MCP protocol - fixed for Render deployment"""
     logger.info(f"SSE endpoint called for connection: {connection_id}")
     
     # Get connection from database
@@ -418,7 +419,7 @@ async def mcp_sse(connection_id: str, request: Request, db: Session = Depends(ge
     messages_url = f"{base_url}/messages"
     
     async def event_stream() -> AsyncGenerator[bytes, None]:
-        """Generate SSE events with proper formatting and keep-alive"""
+        """Generate SSE events with immediate flushing"""
         # Track this connection
         active_sse_connections[session_id] = {
             "connection_id": connection_id,
@@ -429,19 +430,29 @@ async def mcp_sse(connection_id: str, request: Request, db: Session = Depends(ge
         try:
             logger.info(f"Starting SSE stream for connection: {connection_id}, session: {session_id}")
             
-            # Send retry instruction to client (reconnect after 3 seconds if disconnected)
-            yield b"retry: 3000\n\n"
+            # Buffer for accumulating data before yielding
+            buffer = io.BytesIO()
             
-            # Send initial endpoint event immediately
-            endpoint_event = f"event: endpoint\ndata: {messages_url}\nid: {session_id}-1\n\n"
-            yield endpoint_event.encode('utf-8')
-            logger.info(f"Sent endpoint event: {messages_url}")
+            # Send initial messages immediately
+            buffer.write(b"retry: 3000\n\n")
+            buffer.write(f"event: endpoint\ndata: {messages_url}\n\n".encode('utf-8'))
             
-            # Flush immediately to ensure client receives the first event
-            await asyncio.sleep(0.1)
+            # Yield the buffer content
+            buffer.seek(0)
+            initial_data = buffer.read()
+            yield initial_data
+            logger.info(f"Sent initial data ({len(initial_data)} bytes) including endpoint: {messages_url}")
             
-            # Send heartbeat counter
+            # Reset buffer
+            buffer = io.BytesIO()
+            
+            # Send first heartbeat immediately to establish connection
+            buffer.write(b": ping\n\n")
+            buffer.seek(0)
+            yield buffer.read()
+            
             heartbeat_counter = 0
+            last_data_sent = datetime.now()
             
             while True:
                 # Check if client is still connected
@@ -450,56 +461,90 @@ async def mcp_sse(connection_id: str, request: Request, db: Session = Depends(ge
                     break
                 
                 heartbeat_counter += 1
+                current_time = datetime.now()
                 
-                # Send SSE comment as keep-alive (doesn't trigger client events)
-                # This is crucial for Render - it prevents the connection from timing out
-                comment = f": keep-alive {heartbeat_counter} at {datetime.now().isoformat()}\n\n"
-                yield comment.encode('utf-8')
+                # Send data every 5 seconds to prevent timeout
+                buffer = io.BytesIO()
+                
+                # Always send a keep-alive comment
+                buffer.write(f": keep-alive {heartbeat_counter} at {current_time.isoformat()}\n\n".encode('utf-8'))
                 
                 # Every 3rd heartbeat, send actual data event
                 if heartbeat_counter % 3 == 0:
-                    heartbeat_event = {
+                    heartbeat_data = {
                         "count": heartbeat_counter,
-                        "timestamp": datetime.now().isoformat(),
+                        "timestamp": current_time.isoformat(),
                         "session": session_id,
-                        "uptime_seconds": (datetime.now() - active_sse_connections[session_id]["started_at"]).total_seconds()
+                        "uptime_seconds": (current_time - active_sse_connections[session_id]["started_at"]).total_seconds()
                     }
-                    data_event = f"event: heartbeat\ndata: {json.dumps(heartbeat_event)}\nid: {session_id}-{heartbeat_counter}\n\n"
-                    yield data_event.encode('utf-8')
-                    logger.debug(f"Sent heartbeat data event {heartbeat_counter} for session {session_id}")
+                    buffer.write(f"event: heartbeat\ndata: {json.dumps(heartbeat_data)}\n\n".encode('utf-8'))
+                    logger.debug(f"Sending heartbeat event {heartbeat_counter}")
+                
+                # Yield accumulated data
+                buffer.seek(0)
+                data = buffer.read()
+                if data:
+                    yield data
+                    last_data_sent = current_time
                 
                 # Update last heartbeat time
-                active_sse_connections[session_id]["last_heartbeat"] = datetime.now()
+                active_sse_connections[session_id]["last_heartbeat"] = current_time
                 
-                # Wait 10 seconds between heartbeats (well under Render's 30s timeout)
-                await asyncio.sleep(10)
+                # Wait 5 seconds between heartbeats (more frequent to prevent Render timeout)
+                await asyncio.sleep(5)
                 
         except asyncio.CancelledError:
             logger.info(f"SSE connection cancelled for session: {session_id}")
             raise
         except Exception as e:
             logger.error(f"Error in SSE stream for session {session_id}: {e}", exc_info=True)
-            error_event = f"event: error\ndata: {json.dumps({'error': str(e), 'session': session_id})}\n\n"
-            yield error_event.encode('utf-8')
+            error_data = f"event: error\ndata: {json.dumps({'error': str(e), 'session': session_id})}\n\n"
+            yield error_data.encode('utf-8')
         finally:
             # Clean up connection tracking
             active_sse_connections.pop(session_id, None)
             logger.info(f"SSE connection closed for session: {session_id}")
     
-    # Return streaming response with optimized headers for Render
-    return StreamingResponse(
+    # Return streaming response with optimized headers
+    response = StreamingResponse(
         event_stream(),
         media_type="text/event-stream",
         headers={
-            "Cache-Control": "no-cache, no-store, must-revalidate, no-transform",
+            "Cache-Control": "no-cache",
             "Connection": "keep-alive",
-            "X-Accel-Buffering": "no",  # Disable Nginx buffering
-            "X-Content-Type-Options": "nosniff",
-            "Transfer-Encoding": "chunked",
+            "X-Accel-Buffering": "no",
+            "Content-Type": "text/event-stream",
             "Access-Control-Allow-Origin": "*",
-            "Access-Control-Allow-Methods": "GET, OPTIONS",
-            "Access-Control-Allow-Headers": "Accept, Cache-Control",
-            "Access-Control-Expose-Headers": "Content-Type",
+        }
+    )
+    
+    # Disable buffering at response level
+    response.headers["X-Accel-Buffering"] = "no"
+    
+    return response
+
+# Simple SSE test endpoint
+@app.get("/test-sse")
+async def test_sse():
+    """Simple SSE test endpoint for debugging"""
+    async def generate():
+        yield b"retry: 1000\n\n"
+        yield b"data: SSE connection established\n\n"
+        yield b": This is a comment to test keep-alive\n\n"
+        
+        for i in range(5):
+            yield f"data: Count {i}\n\n".encode('utf-8')
+            await asyncio.sleep(1)
+        
+        yield b"data: Test complete\n\n"
+    
+    return StreamingResponse(
+        generate(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
         }
     )
 
@@ -635,25 +680,3 @@ async def mcp_messages(
                 "message": str(e)
             }
         }
-
-# Add a test endpoint for debugging SSE
-@app.get("/test-sse")
-async def test_sse():
-    """Simple SSE test endpoint for debugging"""
-    async def generate():
-        yield b"retry: 1000\n\n"
-        yield b"event: test\ndata: {\"message\": \"SSE is working!\"}\n\n"
-        for i in range(5):
-            await asyncio.sleep(1)
-            yield f": keep-alive {i}\n\n".encode('utf-8')
-            yield f"event: count\ndata: {i}\n\n".encode('utf-8')
-    
-    return StreamingResponse(
-        generate(),
-        media_type="text/event-stream",
-        headers={
-            "Cache-Control": "no-cache",
-            "Connection": "keep-alive",
-            "X-Accel-Buffering": "no",
-        }
-    )
