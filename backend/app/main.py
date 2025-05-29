@@ -9,7 +9,7 @@ import logging
 import asyncio
 import json
 import snowflake.connector
-from datetime import datetime
+from datetime import datetime, date
 import uuid
 import io
 from decimal import Decimal
@@ -23,6 +23,8 @@ class SnowflakeJSONEncoder(json.JSONEncoder):
         if isinstance(obj, Decimal):
             return float(obj)
         elif isinstance(obj, datetime):
+            return obj.isoformat()
+        elif isinstance(obj, date):
             return obj.isoformat()
         elif isinstance(obj, bytes):
             return obj.decode('utf-8', errors='ignore')
@@ -187,8 +189,13 @@ async def read_query(query: str, config: dict) -> Dict[str, Any]:
                         row_dict[columns[i]] = float(value)
                     elif isinstance(value, datetime):
                         row_dict[columns[i]] = value.isoformat()
+                    elif isinstance(value, date) and not isinstance(value, datetime):
+                        # Handle date objects that aren't datetime
+                        row_dict[columns[i]] = value.isoformat()
                     elif isinstance(value, bytes):
                         row_dict[columns[i]] = value.decode('utf-8', errors='ignore')
+                    elif value is None:
+                        row_dict[columns[i]] = None
                     else:
                         row_dict[columns[i]] = value
                 data.append(row_dict)
