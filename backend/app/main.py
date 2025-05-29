@@ -78,77 +78,135 @@ def get_db():
     finally:
         db.close()
 
+def create_snowflake_connection(config: dict) -> snowflake.connector.SnowflakeConnection:
+    """Create a new Snowflake connection"""
+    logger.info(f"Creating new Snowflake connection for {config.get('id', 'default')}")
+    return snowflake.connector.connect(
+        user=config['user'],
+        password=config['password'],
+        account=config['account'],
+        warehouse=config['warehouse'],
+        database=config['database'],
+        schema=config['schema'],
+        role=config['role']
+    )
+
 def get_snowflake_connection(config: dict) -> snowflake.connector.SnowflakeConnection:
-    """Get or create a Snowflake connection"""
+    """Get or create a Snowflake connection with automatic reconnection on auth failure"""
     conn_id = config.get('id', 'default')
     
-    if conn_id not in snowflake_connections or snowflake_connections[conn_id].is_closed():
-        logger.info(f"Creating new Snowflake connection for {conn_id}")
-        snowflake_connections[conn_id] = snowflake.connector.connect(
-            user=config['user'],
-            password=config['password'],
-            account=config['account'],
-            warehouse=config['warehouse'],
-            database=config['database'],
-            schema=config['schema'],
-            role=config['role']
-        )
+    # Check if we have an existing connection
+    if conn_id in snowflake_connections:
+        conn = snowflake_connections[conn_id]
+        
+        # Test if connection is still valid
+        try:
+            if not conn.is_closed():
+                # Quick test query to check if auth is still valid
+                cursor = conn.cursor()
+                cursor.execute("SELECT 1")
+                cursor.close()
+                return conn
+        except Exception as e:
+            error_msg = str(e)
+            if "Authentication token has expired" in error_msg or "390114" in error_msg:
+                logger.info(f"Authentication token expired for connection {conn_id}, reconnecting...")
+            else:
+                logger.warning(f"Connection test failed for {conn_id}: {error_msg}")
+            
+            # Close the old connection
+            try:
+                conn.close()
+            except:
+                pass
+            
+            # Remove from cache
+            del snowflake_connections[conn_id]
     
+    # Create a new connection
+    snowflake_connections[conn_id] = create_snowflake_connection(config)
     return snowflake_connections[conn_id]
+
+def execute_with_retry(config: dict, operation_func, *args, **kwargs):
+    """Execute a database operation with automatic retry on authentication failure"""
+    max_retries = 2
+    retry_count = 0
+    
+    while retry_count < max_retries:
+        try:
+            conn = get_snowflake_connection(config)
+            return operation_func(conn, *args, **kwargs)
+        except Exception as e:
+            error_msg = str(e)
+            if ("Authentication token has expired" in error_msg or "390114" in error_msg) and retry_count < max_retries - 1:
+                logger.info(f"Authentication error detected, retrying... (attempt {retry_count + 1})")
+                # Force reconnection on next attempt
+                conn_id = config.get('id', 'default')
+                if conn_id in snowflake_connections:
+                    try:
+                        snowflake_connections[conn_id].close()
+                    except:
+                        pass
+                    del snowflake_connections[conn_id]
+                retry_count += 1
+            else:
+                # Re-raise the exception if it's not an auth error or we've exhausted retries
+                raise
 
 # MCP Tool implementations
 async def read_query(query: str, config: dict) -> Dict[str, Any]:
-    """Execute a SELECT query on Snowflake"""
+    """Execute a SELECT query on Snowflake with automatic reconnection"""
     if not query.strip().upper().startswith('SELECT'):
         return {"error": "Only SELECT queries are allowed"}
     
-    try:
-        conn = get_snowflake_connection(config)
+    def execute_query(conn, query, config):
         cursor = conn.cursor()
-        
-        # Log the query being executed
-        logger.info(f"Executing query: {query}")
-        
-        # Ensure we're using the correct database and schema context
-        cursor.execute(f"USE DATABASE {config['database']}")
-        cursor.execute(f"USE SCHEMA {config['schema']}")
-        
-        # Execute the actual query
-        cursor.execute(query)
-        
-        # Get column names
-        columns = [desc[0] for desc in cursor.description]
-        
-        # Fetch results
-        results = cursor.fetchall()
-        
-        # Convert to list of dicts with proper type handling
-        data = []
-        for row in results:
-            row_dict = {}
-            for i, value in enumerate(row):
-                if isinstance(value, Decimal):
-                    row_dict[columns[i]] = float(value)
-                elif isinstance(value, datetime):
-                    row_dict[columns[i]] = value.isoformat()
-                elif isinstance(value, bytes):
-                    row_dict[columns[i]] = value.decode('utf-8', errors='ignore')
-                else:
-                    row_dict[columns[i]] = value
-            data.append(row_dict)
-        
-        cursor.close()
-        
-        result = {
-            "success": True,
-            "data": data,
-            "row_count": len(data),
-            "columns": columns
-        }
-        
-        # Ensure the result is JSON serializable
-        return json.loads(json.dumps(result, cls=SnowflakeJSONEncoder))
-        
+        try:
+            # Log the query being executed
+            logger.info(f"Executing query: {query}")
+            
+            # Ensure we're using the correct database and schema context
+            cursor.execute(f"USE DATABASE {config['database']}")
+            cursor.execute(f"USE SCHEMA {config['schema']}")
+            
+            # Execute the actual query
+            cursor.execute(query)
+            
+            # Get column names
+            columns = [desc[0] for desc in cursor.description]
+            
+            # Fetch results
+            results = cursor.fetchall()
+            
+            # Convert to list of dicts with proper type handling
+            data = []
+            for row in results:
+                row_dict = {}
+                for i, value in enumerate(row):
+                    if isinstance(value, Decimal):
+                        row_dict[columns[i]] = float(value)
+                    elif isinstance(value, datetime):
+                        row_dict[columns[i]] = value.isoformat()
+                    elif isinstance(value, bytes):
+                        row_dict[columns[i]] = value.decode('utf-8', errors='ignore')
+                    else:
+                        row_dict[columns[i]] = value
+                data.append(row_dict)
+            
+            result = {
+                "success": True,
+                "data": data,
+                "row_count": len(data),
+                "columns": columns
+            }
+            
+            # Ensure the result is JSON serializable
+            return json.loads(json.dumps(result, cls=SnowflakeJSONEncoder))
+        finally:
+            cursor.close()
+    
+    try:
+        return execute_with_retry(config, execute_query, query, config)
     except Exception as e:
         logger.error(f"Query error: {e}")
         error_msg = str(e)
@@ -163,43 +221,68 @@ async def read_query(query: str, config: dict) -> Dict[str, Any]:
         return {"error": error_msg}
 
 async def list_tables(database: Optional[str], schema: Optional[str], config: dict) -> Dict[str, Any]:
-    """List tables in the specified database and schema"""
+    """List tables in the specified database and schema with automatic reconnection"""
+    def execute_list_tables(conn, db, sch):
+        query = f"SHOW TABLES IN {db}.{sch}"
+        cursor = conn.cursor()
+        try:
+            cursor.execute(query)
+            tables = cursor.fetchall()
+            
+            # Return a simple list of table names for better compatibility
+            table_list = []
+            for t in tables:
+                table_list.append({
+                    "name": t[1],
+                    "database": t[0],
+                    "schema": t[2] if len(t) > 2 else sch,
+                    "type": t[3] if len(t) > 3 else "TABLE"
+                })
+            
+            return {
+                "success": True,
+                "tables": table_list,
+                "count": len(table_list),
+                "database": db,
+                "schema": sch
+            }
+        finally:
+            cursor.close()
+    
     try:
         db = database or config['database']
         sch = schema or config['schema']
         
-        query = f"SHOW TABLES IN {db}.{sch}"
-        
-        conn = get_snowflake_connection(config)
-        cursor = conn.cursor()
-        cursor.execute(query)
-        
-        tables = cursor.fetchall()
-        cursor.close()
-        
-        # Return a simple list of table names for better compatibility
-        table_list = []
-        for t in tables:
-            table_list.append({
-                "name": t[1],
-                "database": t[0],
-                "schema": t[2] if len(t) > 2 else sch,
-                "type": t[3] if len(t) > 3 else "TABLE"
-            })
-        
-        return {
-            "success": True,
-            "tables": table_list,
-            "count": len(table_list),
-            "database": db,
-            "schema": sch
-        }
+        return execute_with_retry(config, execute_list_tables, db, sch)
     except Exception as e:
         logger.error(f"List tables error: {e}")
         return {"success": False, "error": str(e)}
 
 async def describe_table(table_name: str, config: dict) -> Dict[str, Any]:
-    """Get column information for a table"""
+    """Get column information for a table with automatic reconnection"""
+    def execute_describe_table(conn, db, schema, table):
+        query = f"DESCRIBE TABLE {db}.{schema}.{table}"
+        cursor = conn.cursor()
+        try:
+            cursor.execute(query)
+            columns = cursor.fetchall()
+            
+            return {
+                "success": True,
+                "columns": [
+                    {
+                        "name": col[0],
+                        "type": col[1],
+                        "nullable": col[2] == 'Y',
+                        "default": col[3],
+                        "comment": col[8] if len(col) > 8 else None
+                    }
+                    for col in columns
+                ]
+            }
+        finally:
+            cursor.close()
+    
     try:
         # Parse table name (could be fully qualified)
         parts = table_name.split('.')
@@ -213,80 +296,63 @@ async def describe_table(table_name: str, config: dict) -> Dict[str, Any]:
             schema = config['schema']
             table = table_name
         
-        query = f"DESCRIBE TABLE {db}.{schema}.{table}"
-        
-        conn = get_snowflake_connection(config)
-        cursor = conn.cursor()
-        cursor.execute(query)
-        
-        columns = cursor.fetchall()
-        cursor.close()
-        
-        return {
-            "success": True,
-            "columns": [
-                {
-                    "name": col[0],
-                    "type": col[1],
-                    "nullable": col[2] == 'Y',
-                    "default": col[3],
-                    "comment": col[8] if len(col) > 8 else None
-                }
-                for col in columns
-            ]
-        }
+        return execute_with_retry(config, execute_describe_table, db, schema, table)
     except Exception as e:
         logger.error(f"Describe table error: {e}")
         return {"error": str(e)}
 
 async def list_databases(config: dict) -> Dict[str, Any]:
-    """List all databases"""
-    try:
-        conn = get_snowflake_connection(config)
+    """List all databases with automatic reconnection"""
+    def execute_list_databases(conn):
         cursor = conn.cursor()
-        cursor.execute("SHOW DATABASES")
-        
-        databases = cursor.fetchall()
-        cursor.close()
-        
-        # Convert to simple list with proper type handling
-        db_list = []
-        for db in databases:
-            # db[1] is the database name, db[0] is created timestamp
-            db_list.append({
-                "name": db[1],
-                "created": db[0].isoformat() if isinstance(db[0], datetime) else str(db[0])
-            })
-        
-        result = {
-            "success": True,
-            "databases": db_list,
-            "count": len(db_list)
-        }
-        
-        # Ensure JSON serializable
-        return json.loads(json.dumps(result, cls=SnowflakeJSONEncoder))
-        
+        try:
+            cursor.execute("SHOW DATABASES")
+            databases = cursor.fetchall()
+            
+            # Convert to simple list with proper type handling
+            db_list = []
+            for db in databases:
+                # db[1] is the database name, db[0] is created timestamp
+                db_list.append({
+                    "name": db[1],
+                    "created": db[0].isoformat() if isinstance(db[0], datetime) else str(db[0])
+                })
+            
+            result = {
+                "success": True,
+                "databases": db_list,
+                "count": len(db_list)
+            }
+            
+            # Ensure JSON serializable
+            return json.loads(json.dumps(result, cls=SnowflakeJSONEncoder))
+        finally:
+            cursor.close()
+    
+    try:
+        return execute_with_retry(config, execute_list_databases)
     except Exception as e:
         logger.error(f"List databases error: {e}")
         return {"success": False, "error": str(e)}
 
 async def list_schemas(database: Optional[str], config: dict) -> Dict[str, Any]:
-    """List all schemas in a database"""
+    """List all schemas in a database with automatic reconnection"""
+    def execute_list_schemas(conn, db):
+        cursor = conn.cursor()
+        try:
+            cursor.execute(f"SHOW SCHEMAS IN DATABASE {db}")
+            schemas = cursor.fetchall()
+            
+            return {
+                "success": True,
+                "schemas": [{"name": s[1], "database": db} for s in schemas]
+            }
+        finally:
+            cursor.close()
+    
     try:
         db = database or config['database']
-        
-        conn = get_snowflake_connection(config)
-        cursor = conn.cursor()
-        cursor.execute(f"SHOW SCHEMAS IN DATABASE {db}")
-        
-        schemas = cursor.fetchall()
-        cursor.close()
-        
-        return {
-            "success": True,
-            "schemas": [{"name": s[1], "database": db} for s in schemas]
-        }
+        return execute_with_retry(config, execute_list_schemas, db)
     except Exception as e:
         logger.error(f"List schemas error: {e}")
         return {"error": str(e)}
@@ -398,11 +464,17 @@ async def create_connection(
     try:
         config = connection.dict()
         config['id'] = db_connection.id
-        conn = get_snowflake_connection(config)
-        cursor = conn.cursor()
-        cursor.execute("SELECT CURRENT_VERSION()")
-        cursor.fetchone()
-        cursor.close()
+        
+        # Use execute_with_retry to test connection
+        def test_connection(conn):
+            cursor = conn.cursor()
+            try:
+                cursor.execute("SELECT CURRENT_VERSION()")
+                return cursor.fetchone()
+            finally:
+                cursor.close()
+        
+        execute_with_retry(config, test_connection)
         
         db_connection.active = True
         db.commit()
