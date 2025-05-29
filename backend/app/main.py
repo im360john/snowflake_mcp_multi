@@ -550,8 +550,14 @@ async def delete_connection(
     logger.info(f"Connection {connection_id} deleted successfully")
     return {"message": "Connection deleted"}
 
-# Store message queues for each SSE session
+# Store message queues for each SSE session (connection_id -> queue)
 message_queues: Dict[str, asyncio.Queue] = {}
+
+# Store active SSE connections (session_id -> connection info)
+active_sse_connections: Dict[str, Dict[str, Any]] = {}
+
+# Lock for thread-safe operations on message queues
+message_queue_lock = asyncio.Lock()
 
 # MCP SSE Endpoint - Optimized for LibreChat SSE transport
 @app.get("/mcp/{connection_id}/sse")
@@ -572,8 +578,13 @@ async def mcp_sse(connection_id: str, request: Request, db: Session = Depends(ge
     session_id = str(uuid.uuid4())
     
     # Create a message queue for this session
-    message_queue = asyncio.Queue()
-    message_queues[connection_id] = message_queue
+    async with message_queue_lock:
+        # If there's an existing queue, log a warning
+        if connection_id in message_queues:
+            logger.warning(f"Replacing existing message queue for connection {connection_id}")
+        
+        message_queue = asyncio.Queue()
+        message_queues[connection_id] = message_queue
     
     # Get the full URL for the messages endpoint
     base_url = str(request.url).replace('/sse', '')
@@ -637,8 +648,13 @@ async def mcp_sse(connection_id: str, request: Request, db: Session = Depends(ge
             # Cancel heartbeat task
             if 'heartbeat_task' in locals():
                 heartbeat_task.cancel()
+                try:
+                    await heartbeat_task
+                except asyncio.CancelledError:
+                    pass
             # Clean up
-            message_queues.pop(connection_id, None)
+            async with message_queue_lock:
+                message_queues.pop(connection_id, None)
             active_sse_connections.pop(session_id, None)
             logger.info(f"SSE connection closed for session: {session_id}")
     
@@ -676,6 +692,50 @@ async def test_sse():
             "X-Accel-Buffering": "no",
         }
     )
+
+@app.get("/mcp/{connection_id}/health")
+async def mcp_health(connection_id: str, db: Session = Depends(get_db)):
+    """Health check for a specific MCP connection"""
+    conn = db.query(SnowflakeConnection).filter(
+        SnowflakeConnection.id == connection_id
+    ).first()
+    
+    if not conn:
+        raise HTTPException(status_code=404, detail="Connection not found")
+    
+    # Check if SSE connection is active
+    has_sse = connection_id in message_queues
+    
+    # Test Snowflake connection
+    snowflake_healthy = False
+    try:
+        config = {
+            'id': conn.id,
+            'user': conn.user,
+            'password': conn.password,
+            'account': conn.account,
+            'warehouse': conn.warehouse,
+            'database': conn.database,
+            'schema': conn.schema,
+            'role': conn.role
+        }
+        
+        sf_conn = get_snowflake_connection(config)
+        cursor = sf_conn.cursor()
+        cursor.execute("SELECT 1")
+        cursor.close()
+        snowflake_healthy = True
+    except Exception as e:
+        logger.error(f"Snowflake health check failed: {e}")
+    
+    return {
+        "connection_id": connection_id,
+        "name": conn.name,
+        "active": conn.active,
+        "has_sse_connection": has_sse,
+        "snowflake_healthy": snowflake_healthy,
+        "ready": conn.active and snowflake_healthy
+    }
 
 # Add endpoint to check active SSE connections
 @app.get("/mcp/sse-status")
@@ -721,9 +781,32 @@ async def mcp_messages(
     
     # Get the message queue for this connection
     message_queue = message_queues.get(connection_id)
+    
+    # Special handling for ping and initialize when no SSE connection exists
     if not message_queue:
-        logger.error(f"No message queue found for connection {connection_id}")
-        return Response(status_code=503)  # Service Unavailable
+        if method == "ping":
+            logger.warning(f"No SSE connection for {connection_id}, but received ping - responding with 200 OK")
+            return Response(status_code=200)
+        
+        elif method == "initialize":
+            logger.warning(f"No SSE connection for {connection_id}, but received initialize - responding directly")
+            return {
+                "jsonrpc": "2.0",
+                "id": request_id,
+                "result": {
+                    "protocolVersion": "2025-03-26",
+                    "capabilities": {
+                        "tools": {}
+                    },
+                    "serverInfo": {
+                        "name": f"snowflake-{conn.name}",
+                        "version": "1.0.0"
+                    }
+                }
+            }
+        else:
+            logger.error(f"No message queue found for connection {connection_id} for method {method}")
+            return Response(status_code=503)  # Service Unavailable
     
     # Build config for Snowflake connection
     config = {
