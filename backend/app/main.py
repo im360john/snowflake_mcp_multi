@@ -577,6 +577,11 @@ async def mcp_sse(connection_id: str, request: Request, db: Session = Depends(ge
     # Generate unique session ID for this SSE connection
     session_id = str(uuid.uuid4())
     
+    # Log existing connections for debugging
+    existing_sessions = [s for s, info in active_sse_connections.items() if info["connection_id"] == connection_id]
+    if existing_sessions:
+        logger.warning(f"Found {len(existing_sessions)} existing SSE sessions for connection {connection_id}: {existing_sessions}")
+    
     # Create a message queue for this session
     async with message_queue_lock:
         # If there's an existing queue, log a warning
@@ -603,9 +608,16 @@ async def mcp_sse(connection_id: str, request: Request, db: Session = Depends(ge
         try:
             logger.info(f"Starting SSE stream for connection: {connection_id}, session: {session_id}")
             
+            # Send initial retry suggestion
+            yield b"retry: 10000\n\n"
+            
             # Send the endpoint URL as required by MCP SSE transport
             yield f"event: endpoint\ndata: {messages_url}\n\n".encode('utf-8')
             logger.info(f"Sent endpoint URL: {messages_url}")
+            
+            # Send a ready event to signal connection established
+            yield b"event: ready\ndata: {\"status\": \"connected\"}\n\n"
+            logger.info(f"SSE connection ready for {connection_id}")
             
             # Start tasks for heartbeat and message handling
             async def heartbeat_sender():
@@ -658,15 +670,23 @@ async def mcp_sse(connection_id: str, request: Request, db: Session = Depends(ge
             active_sse_connections.pop(session_id, None)
             logger.info(f"SSE connection closed for session: {session_id}")
     
-    # Return streaming response
-    return StreamingResponse(
+    # Return streaming response with appropriate headers
+    response = StreamingResponse(
         event_stream(),
         media_type="text/event-stream",
         headers={
-            "Cache-Control": "no-cache",
+            "Cache-Control": "no-cache, no-store, must-revalidate",
+            "Pragma": "no-cache",
+            "Expires": "0",
             "X-Accel-Buffering": "no",
+            "Connection": "keep-alive",
         }
     )
+    
+    # Log that we're returning the SSE response
+    logger.info(f"Returning SSE response for connection {connection_id}, session {session_id}")
+    
+    return response
 
 # Simple SSE test endpoint
 @app.get("/test-sse")
@@ -692,6 +712,40 @@ async def test_sse():
             "X-Accel-Buffering": "no",
         }
     )
+
+@app.post("/mcp/{connection_id}/cleanup")
+async def mcp_cleanup(connection_id: str, db: Session = Depends(get_db)):
+    """Cleanup endpoint for graceful shutdown"""
+    logger.info(f"Cleanup requested for connection: {connection_id}")
+    
+    # Check if connection exists
+    conn = db.query(SnowflakeConnection).filter(
+        SnowflakeConnection.id == connection_id
+    ).first()
+    
+    if not conn:
+        raise HTTPException(status_code=404, detail="Connection not found")
+    
+    # Clean up message queue
+    async with message_queue_lock:
+        if connection_id in message_queues:
+            logger.info(f"Removing message queue for connection {connection_id}")
+            del message_queues[connection_id]
+    
+    # Clean up active SSE connections
+    sessions_to_remove = []
+    for session_id, info in active_sse_connections.items():
+        if info["connection_id"] == connection_id:
+            sessions_to_remove.append(session_id)
+    
+    for session_id in sessions_to_remove:
+        logger.info(f"Removing SSE session {session_id} for connection {connection_id}")
+        del active_sse_connections[session_id]
+    
+    return {
+        "message": "Cleanup completed",
+        "sessions_removed": len(sessions_to_remove)
+    }
 
 @app.get("/mcp/{connection_id}/health")
 async def mcp_health(connection_id: str, db: Session = Depends(get_db)):
@@ -804,6 +858,12 @@ async def mcp_messages(
                     }
                 }
             }
+        
+        elif method == "notifications/cancelled":
+            # Handle notification cancellation without SSE - just acknowledge it
+            logger.info(f"Received cancellation notification for {connection_id} without SSE connection")
+            return Response(status_code=202)  # Accepted
+        
         else:
             logger.error(f"No message queue found for connection {connection_id} for method {method}")
             return Response(status_code=503)  # Service Unavailable
